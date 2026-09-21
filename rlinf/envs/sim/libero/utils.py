@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 def get_libero_type() -> str:
     """
-    Returns the type of LIBERO, which can be "standard", "pro", or "plus".
+    Returns the type of LIBERO: "standard", "pro", "plus", or "safe".
     """
     return os.environ.get("LIBERO_TYPE", "standard").lower()
 

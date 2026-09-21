@@ -47,6 +47,9 @@ LIBERO 是基于 robosuite（MuJoCo）的机器人操作仿真基准，涵盖 Sp
    * - ``libero_spatial_molmoact2_eval.yaml``
      - Spatial
      - MolmoAct2
+   * - ``libero_spatial_openvlaoft_eval.yaml``
+     - Spatial
+     - OpenVLA-OFT
    * - ``libero_object_openpi_pi05_eval.yaml``
      - Object
      - π₀.₅

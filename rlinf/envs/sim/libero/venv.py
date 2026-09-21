@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import multiprocessing
+import os
 import warnings
 from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
@@ -78,6 +79,46 @@ warnings.simplefilter("once", DeprecationWarning)
 LIBERO_CAMERA_OBS_NAMES = ("agentview_image", "robot0_eye_in_hand_image")
 
 
+def _normalize_egl_device_id() -> None:
+    """Translate a stale global EGL id into the worker-local namespace.
+
+    RLinf isolates each Ray worker with ``CUDA_VISIBLE_DEVICES``.  On drivers
+    where EGL enumeration is filtered by that variable, robosuite then sees a
+    single device (index 0), even if the scheduler selected physical GPU 4.
+    Keep a valid scheduler-provided mapping, but fall back to local index 0
+    when it is outside the enumeration visible in this simulator subprocess.
+    """
+    if os.environ.get("MUJOCO_GL", "").lower() != "egl":
+        return
+    requested = os.environ.get("MUJOCO_EGL_DEVICE_ID")
+    if requested is None:
+        return
+    try:
+        from robosuite.renderers.context.egl_context import EGL
+
+        num_devices = len(EGL.eglQueryDevicesEXT())
+        requested_id = int(requested)
+    except (ImportError, TypeError, ValueError):
+        return
+    if num_devices > 0 and not 0 <= requested_id < num_devices:
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = "0"
+        os.environ["EGL_DEVICE_ID"] = "0"
+
+
+def _get_contact_pairs(env) -> list[tuple[str, str]]:
+    """Return normalized MuJoCo geom contact pairs for SafeLIBERO auditing."""
+    rob = getattr(env, "env", env)
+    while hasattr(rob, "env"):
+        rob = rob.env
+    sim = rob.sim
+    pairs = set()
+    for contact in sim.data.contact[: sim.data.ncon]:
+        geom1 = sim.model.geom_id2name(contact.geom1) or f"geom:{contact.geom1}"
+        geom2 = sim.model.geom_id2name(contact.geom2) or f"geom:{contact.geom2}"
+        pairs.add(tuple(sorted((geom1, geom2))))
+    return sorted(pairs)
+
+
 def _set_camera_rendering(env, enabled: bool) -> None:
     """Enable or disable LIBERO camera observables without resetting the env."""
     rob = getattr(env, "env", env)
@@ -111,6 +152,7 @@ def _worker(
         return None
 
     parent.close()
+    _normalize_egl_device_id()
     env = env_fn_wrapper.data()
     try:
         while True:
@@ -121,6 +163,12 @@ def _worker(
                 break
             if cmd == "step":
                 env_return = env.step(data)
+                if os.environ.get("LIBERO_TYPE", "standard").lower() == "safe":
+                    env_return = list(env_return)
+                    info = dict(env_return[3])
+                    info["_safelibero_contact_pairs"] = _get_contact_pairs(env)
+                    env_return[3] = info
+                    env_return = tuple(env_return)
                 if obs_bufs is not None:
                     _encode_obs(env_return[0], obs_bufs)
                     env_return = (None, *env_return[1:])

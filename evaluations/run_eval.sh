@@ -188,6 +188,8 @@ if [ "${BENCHMARK}" = "libero" ]; then
     elif [ "${LIBERO_TYPE}" = "plus" ]; then
         export LIBERO_SUFFIX="${LIBERO_SUFFIX:-all}"
         echo "Evaluation Mode: LIBERO-PLUS | Suffix: ${LIBERO_SUFFIX}"
+    elif [ "${LIBERO_TYPE}" = "safe" ]; then
+        echo "Evaluation Mode: SafeLIBERO"
     else
         echo "Evaluation Mode: Standard LIBERO"
     fi

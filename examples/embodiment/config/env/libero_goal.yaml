@@ -1,6 +1,10 @@
 env_type: libero
 task_suite_name: libero_goal
 
+# Used only with LIBERO_TYPE=safe and a safelibero_* task suite.
+safety_level: I
+collision_displacement_threshold: 0.001
+
 total_num_envs: null
 
 auto_reset: False
