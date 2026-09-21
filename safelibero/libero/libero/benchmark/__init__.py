@@ -143,7 +143,10 @@ class Benchmark(abc.ABC):
         init_states_path = init_states_path.replace(".pruned_init", f"_level_{self.safety_level}.pruned_init")
 
 
-        init_states = torch.load(init_states_path)
+        # PyTorch 2.6+ defaults ``weights_only`` to True.  LIBERO init-state
+        # files contain numpy objects rather than model weights, so load this
+        # trusted, repository-provided data explicitly in legacy mode.
+        init_states = torch.load(init_states_path, weights_only=False)
         
         return init_states
 
@@ -180,5 +183,4 @@ class SAFELIBERO_LONG(Benchmark):
         super().__init__(task_order_index=task_order_index, safety_level=safety_level)
         self.name = "safelibero_long"
         self._make_benchmark()
-
 
