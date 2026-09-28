@@ -8,7 +8,7 @@ VENV_PATH="${VENV_PATH:-${WORKSPACE_ROOT}/.venv-openvlaoft-libero-safety}"
 
 ACTOR_CKPT="${ACTOR_CKPT:-/oss/xujingbo/checkpoints/rlinf/libero_safety_one_shot_full_sft_2000/openvlaoft_full_2000/checkpoints/global_step_1500/actor}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-/oss/xujingbo/checkpoints/rlinf/libero_safety_one_shot_full_sft_2000/tensorboard/config.yaml}"
-HF_MODEL="${HF_MODEL:-/oss/xujingbo/checkpoints/rlinf/libero_safety_one_shot_full_sft_2000/openvlaoft_full_2000/hf_step_1500}"
+HF_MODEL="${HF_MODEL:-${WORKSPACE_ROOT}/checkpoints/libero_safety_one_shot_full_step1500_hf}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/oss/xujingbo/evaluations/libero_safety/openvlaoft_full_2000_step1500}"
 DATASET_STATS="${DATASET_STATS:-${WORKSPACE_ROOT}/datasets/libero_safety_one_shot/meta/stats.json}"
 GPU_RANKS="${GPU_RANKS:-0-4}"
@@ -23,12 +23,13 @@ export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 
 mkdir -p "$HF_MODEL" "$OUTPUT_ROOT"
 
-if [ ! -f "${HF_MODEL}/config.json" ]; then
+if [ ! -f "${HF_MODEL}/.conversion_complete" ]; then
   python -m rlinf.utils.ckpt_convertor.fsdp_convertor.convert_pt_to_hf \
-    convertor.train_config_path="$TRAIN_CONFIG" \
+    +convertor.train_config_path="$TRAIN_CONFIG" \
     convertor.ckpt_path="${ACTOR_CKPT}/model_state_dict/full_weights.pt" \
     convertor.save_path="$HF_MODEL" \
     convertor.torch_dtype=bf16
+  touch "${HF_MODEL}/.conversion_complete"
 fi
 
 suites=(affordance human_safety obstacle_avoidance obstacle_avoidance_human)
@@ -51,7 +52,7 @@ for suite in "${suites[@]}"; do
       IS_LORA=False \
       RLINF_RUNTIME_DIR="/r-eval-${suite}-${level}" \
       bash evaluations/run_safelibero.sh \
-        rollout.model.dataset_statistics_path="$DATASET_STATS" \
+        +rollout.model.dataset_statistics_path="$DATASET_STATS" \
         env.eval.seed="$EVAL_SEED" \
         env.eval.ignore_terminations=False \
         runner.logger.log_path="$run_dir" \
