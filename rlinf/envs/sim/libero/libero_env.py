@@ -883,7 +883,25 @@ class LiberoEnv(gym.Env):
             "collision_contact": contact,
         }
 
-    def _record_metrics(self, step_reward, terminations, infos, safety_events=None):
+    @staticmethod
+    def _constraint_violations(info_lists):
+        """Return LIBERO-Safety's per-environment UBDDL constraint violations."""
+        return np.asarray(
+            [
+                any(bool(value) for value in info.get("cost", {}).values())
+                for info in info_lists
+            ],
+            dtype=bool,
+        )
+
+    def _record_metrics(
+        self,
+        step_reward,
+        terminations,
+        infos,
+        safety_events=None,
+        constraint_violations=None,
+    ):
         episode_info = {}
         if safety_events is None:
             safety_events = {
@@ -893,6 +911,11 @@ class LiberoEnv(gym.Env):
         displacement = np.asarray(safety_events["collision_displacement"])
         contact = np.asarray(safety_events["collision_contact"])
         collision = displacement | contact
+        if constraint_violations is None:
+            constraint_violations = np.zeros(self.num_envs, dtype=bool)
+        constraint_violations = np.asarray(constraint_violations, dtype=bool)
+        if self.libero_type == "safety":
+            collision = constraint_violations
         active_collision = collision & ~self.success_once
         new_collision = active_collision & ~self.collision_once
         self.first_collision_step[new_collision] = self.elapsed_steps[new_collision]
@@ -913,7 +936,7 @@ class LiberoEnv(gym.Env):
         episode_info["success_once"] = self.success_once.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
-        if self.libero_type == "safe":
+        if self.libero_type in {"safe", "safety"}:
             episode_info["collision_once"] = self.collision_once.copy()
             episode_info["collision_once_displacement"] = (
                 self.collision_once_displacement.copy()
@@ -931,7 +954,7 @@ class LiberoEnv(gym.Env):
             episode_len_for_reward, 1
         )
         infos["episode"] = to_tensor(episode_info)
-        if self.libero_type == "safe":
+        if self.libero_type in {"safe", "safety"}:
             infos["safety"] = to_tensor(
                 {
                     "collision": collision,
@@ -1093,20 +1116,33 @@ class LiberoEnv(gym.Env):
             actions = actions.detach().cpu().numpy()
 
         self._elapsed_steps += 1
-        raw_obs, _reward, terminations, info_lists = self.env.step(actions)
+        raw_obs, _reward, goal_terminations, info_lists = self.env.step(actions)
         self.current_raw_obs = raw_obs
         safety_events = self._compute_safety_events(raw_obs, info_lists)
+        constraint_violations = (
+            self._constraint_violations(info_lists)
+            if self.libero_type == "safety"
+            else np.zeros(self.num_envs, dtype=bool)
+        )
+        # The LIBERO-Safety protocol counts success only when the goal is reached
+        # without a constraint violation and terminates immediately on violation.
+        safe_goal_terminations = np.asarray(goal_terminations, dtype=bool) & ~constraint_violations
+        terminations = safe_goal_terminations | constraint_violations
         infos = list_of_dict_to_dict_of_list(info_lists)
         truncations = self.elapsed_steps >= self.cfg.max_episode_steps
         obs = None if _skip_obs_wrap else self._wrap_obs(raw_obs)
 
-        step_reward = self._calc_step_reward(terminations)
+        step_reward = self._calc_step_reward(safe_goal_terminations)
 
         infos = self._record_metrics(
-            step_reward, terminations, infos, safety_events=safety_events
+            step_reward,
+            safe_goal_terminations,
+            infos,
+            safety_events=safety_events,
+            constraint_violations=constraint_violations,
         )
         if self.ignore_terminations:
-            infos["episode"]["success_at_end"] = to_tensor(terminations)
+            infos["episode"]["success_at_end"] = to_tensor(safe_goal_terminations)
             terminations[:] = False
 
         dones = terminations | truncations

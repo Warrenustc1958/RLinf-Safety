@@ -19,14 +19,14 @@ cluster:
 runner:
   task_type: sft
   logger:
-    log_path: ../results
+    log_path: /oss/xujingbo/checkpoints/rlinf/libero_safety_one_shot_full_sft_2000
     project_name: rlinf
-    experiment_name: libero_safety_sft_openvlaoft
+    experiment_name: openvlaoft_full_2000
     logger_backends: [tensorboard]
   max_epochs: -1
-  max_steps: 10000
+  max_steps: 2000
   val_check_interval: -1
-  save_interval: 1000
+  save_interval: 500
   resume_dir: null
 
 data:
@@ -59,9 +59,10 @@ actor:
     use_proprio: false
     add_value_head: false
     attn_implementation: sdpa
-    # Continue from the public LIBERO-130 adapter and update only its LoRA weights.
-    is_lora: true
-    lora_path: ${actor.model.model_path}/lora_adapter
+    # Full-parameter SFT. The adjacent LIBERO-130 LoRA adapter is intentionally
+    # not loaded; training starts from the base weights in model_path.
+    is_lora: false
+    lora_path: null
 
   optim:
     lr: 2.0e-5
