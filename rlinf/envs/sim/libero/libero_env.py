@@ -158,6 +158,25 @@ class LiberoEnv(gym.Env):
                 raise ValueError(
                     "LIBERO_TYPE=safe requires a safelibero_* task_suite_name"
                 )
+        elif self.libero_type == "safety":
+            raw_level = str(cfg.get("safety_level", "L0")).upper()
+            if raw_level.startswith("L"):
+                raw_level = raw_level[1:]
+            if raw_level not in {"0", "1", "2"}:
+                raise ValueError("LIBERO-Safety safety_level must be L0, L1, or L2")
+            self.safety_level = int(raw_level)
+            supported_suites = {
+                "affordance",
+                "human_safety",
+                "obstacle_avoidance",
+                "obstacle_avoidance_human",
+            }
+            if str(cfg.task_suite_name).lower() not in supported_suites:
+                raise ValueError(
+                    "LIBERO_TYPE=safety simulator supports affordance, "
+                    "human_safety, obstacle_avoidance, and "
+                    "obstacle_avoidance_human"
+                )
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -165,11 +184,24 @@ class LiberoEnv(gym.Env):
 
         suite_cls = get_benchmark_overridden(cfg.task_suite_name)
         suite_kwargs = (
-            {"safety_level": self.safety_level}
-            if self.libero_type == "safe"
-            else {}
+            {"safety_level": self.safety_level} if self.libero_type == "safe" else {}
         )
         self.task_suite: Benchmark = suite_cls(**suite_kwargs)
+        if self.libero_type == "safety":
+            level_task_ids = [
+                task_id
+                for task_id in range(self.task_suite.get_num_tasks())
+                if self.task_suite.get_task(task_id).level == self.safety_level
+            ]
+            if self.task_id_filter is None:
+                self.task_id_filter = level_task_ids
+            else:
+                invalid_ids = sorted(set(self.task_id_filter) - set(level_task_ids))
+                if invalid_ids:
+                    raise ValueError(
+                        f"task_id_filter contains tasks outside L{self.safety_level}: "
+                        f"{invalid_ids}"
+                    )
 
         self._compute_total_num_group_envs()
         self.reset_state_ids_all = self.get_reset_state_ids_all()
@@ -214,6 +246,11 @@ class LiberoEnv(gym.Env):
             logger.info(
                 "Evaluation Mode: SafeLIBERO | Safety level: "
                 f"{str(self.cfg.get('safety_level', 'I')).upper()}"
+            )
+        elif libero_type == "safety":
+            logger.info(
+                "Evaluation Mode: LIBERO-Safety | Level: "
+                f"{str(self.cfg.get('safety_level', 'L0')).upper()}"
             )
         else:
             logger.info("Evaluation Mode: Standard LIBERO")
@@ -337,7 +374,12 @@ class LiberoEnv(gym.Env):
             task = self.task_suite.get_task(self.task_ids[env_id])
             folder_name = task.problem_folder
             file_name = task.bddl_file
-            original_path = os.path.join(bddl_root, folder_name, file_name)
+            if variant == "safety":
+                original_path = self.task_suite.get_task_bddl_file_path(
+                    task.level, task.level_id
+                )
+            else:
+                original_path = os.path.join(bddl_root, folder_name, file_name)
 
             final_path = original_path
 
@@ -499,7 +541,7 @@ class LiberoEnv(gym.Env):
         self.total_num_group_envs = 0
         self.trial_id_bins = []
         for task_id in range(self.task_suite.get_num_tasks()):
-            task_num_trials = len(self.task_suite.get_task_init_states(task_id))
+            task_num_trials = len(self._get_task_init_states(task_id))
             self.trial_id_bins.append(task_num_trials)
             self.total_num_group_envs += task_num_trials
         self.cumsum_trial_id_bins = np.cumsum(self.trial_id_bins)
@@ -676,7 +718,7 @@ class LiberoEnv(gym.Env):
                     if self.is_eval:
                         logger.error(msg)
                         raise RuntimeError(msg)
-                    states = self.task_suite.get_task_init_states(self.task_ids[env_id])
+                    states = self._get_task_init_states(self.task_ids[env_id])
                     init_path = f"<suite:{task.problem_folder}/{task.init_states_file}>"
                     used_folder = task.problem_folder
                     logger.warning(
@@ -701,12 +743,18 @@ class LiberoEnv(gym.Env):
             return init_state
 
         init_state = [
-            self.task_suite.get_task_init_states(self.task_ids[env_id])[
-                self.trial_ids[env_id]
-            ]
+            self._get_task_init_states(self.task_ids[env_id])[self.trial_ids[env_id]]
             for env_id in env_idx
         ]
         return init_state
+
+    def _get_task_init_states(self, task_id):
+        """Load task states across standard and level-aware LIBERO APIs."""
+        task_id = int(task_id)
+        if self.libero_type == "safety":
+            task = self.task_suite.get_task(task_id)
+            return self.task_suite.get_task_init_states(task.level, task.level_id)
+        return self.task_suite.get_task_init_states(task_id)
 
     @property
     def elapsed_steps(self):
@@ -797,8 +845,7 @@ class LiberoEnv(gym.Env):
                 tuple(pair) for pair in pairs if name in pair[0] or name in pair[1]
             }
             logger.info(
-                "[SafeLIBERO reset] env=%s task_id=%s trial_id=%s "
-                "level=%s obstacle=%s",
+                "[SafeLIBERO reset] env=%s task_id=%s trial_id=%s level=%s obstacle=%s",
                 env_id,
                 self.task_ids[env_id],
                 self.trial_ids[env_id],
@@ -822,14 +869,11 @@ class LiberoEnv(gym.Env):
                 continue
             current = np.asarray(obs[f"{name}_pos"])
             displacement[env_id] = (
-                np.abs(current - initial).sum()
-                > self.collision_displacement_threshold
+                np.abs(current - initial).sum() > self.collision_displacement_threshold
             )
             pairs = info.pop("_safelibero_contact_pairs", [])
             obstacle_pairs = {
-                tuple(pair)
-                for pair in pairs
-                if name in pair[0] or name in pair[1]
+                tuple(pair) for pair in pairs if name in pair[0] or name in pair[1]
             }
             contact[env_id] = bool(
                 obstacle_pairs - self._baseline_contact_pairs[env_id]
@@ -839,9 +883,7 @@ class LiberoEnv(gym.Env):
             "collision_contact": contact,
         }
 
-    def _record_metrics(
-        self, step_reward, terminations, infos, safety_events=None
-    ):
+    def _record_metrics(self, step_reward, terminations, infos, safety_events=None):
         episode_info = {}
         if safety_events is None:
             safety_events = {
@@ -871,16 +913,15 @@ class LiberoEnv(gym.Env):
         episode_info["success_once"] = self.success_once.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
-        episode_info["collision_once"] = self.collision_once.copy()
-        episode_info["collision_once_displacement"] = (
-            self.collision_once_displacement.copy()
-        )
-        episode_info["collision_once_contact"] = self.collision_once_contact.copy()
-        episode_info["collision_step_count"] = self.collision_step_count.copy()
-        episode_info["first_collision_step"] = self.first_collision_step.copy()
-        episode_info["safe_success_once"] = (
-            self.success_once & ~self.collision_once
-        )
+        if self.libero_type == "safe":
+            episode_info["collision_once"] = self.collision_once.copy()
+            episode_info["collision_once_displacement"] = (
+                self.collision_once_displacement.copy()
+            )
+            episode_info["collision_once_contact"] = self.collision_once_contact.copy()
+            episode_info["collision_step_count"] = self.collision_step_count.copy()
+            episode_info["first_collision_step"] = self.first_collision_step.copy()
+            episode_info["safe_success_once"] = self.success_once & ~self.collision_once
 
         # Use success episode_len for reward if already succeeded, else current elapsed
         episode_len_for_reward = np.where(
@@ -890,13 +931,14 @@ class LiberoEnv(gym.Env):
             episode_len_for_reward, 1
         )
         infos["episode"] = to_tensor(episode_info)
-        infos["safety"] = to_tensor(
-            {
-                "collision": collision,
-                "collision_displacement": displacement,
-                "collision_contact": contact,
-            }
-        )
+        if self.libero_type == "safe":
+            infos["safety"] = to_tensor(
+                {
+                    "collision": collision,
+                    "collision_displacement": displacement,
+                    "collision_contact": contact,
+                }
+            )
         return infos
 
     def _extract_image_and_state(self, obs):

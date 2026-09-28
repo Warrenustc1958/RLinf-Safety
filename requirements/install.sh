@@ -1,5 +1,4 @@
 #! /bin/bash
-
 set -eo pipefail
 
 TARGET=""
@@ -105,7 +104,7 @@ NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_ENGINES=("sglang" "vllm")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "dreamzero" "fastwam" "cosmos3" "qwen3_vl" "abot_m0" "molmoact2" "evo1" "diffusion")
-SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "robocasa365" "franka" "franka-ros" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "so101" "piper" "dummy" "polaris")
+SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "liberosafety" "metaworld" "calvin" "isaaclab" "robocasa" "robocasa365" "franka" "franka-ros" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "so101" "piper" "dummy" "polaris")
 
 #=======================Utility Functions=======================
 
@@ -1935,7 +1934,7 @@ EOF
 
 install_openvla_model() {
     case "$ENV_NAME" in
-        maniskill_libero|libero)
+        maniskill_libero|libero|liberosafety)
             create_and_sync_venv
             install_common_embodied_deps
             install_${ENV_NAME}_env
@@ -1979,7 +1978,7 @@ install_openvla_oft_model() {
             install_flash_attn
             popd >/dev/null
             ;;
-        maniskill_libero|libero)
+        maniskill_libero|libero|liberosafety)
             create_and_sync_venv
             install_common_embodied_deps
             install_${ENV_NAME}_env
@@ -2697,7 +2696,7 @@ install_env_only() {
         polaris)
             install_polaris_env
             ;;
-        libero|maniskill_libero)
+        libero|liberosafety|maniskill_libero)
             install_common_embodied_deps
             install_${ENV_NAME}_env
             ;;
@@ -2762,6 +2761,49 @@ install_libero_env() {
     materialize_package_files rlinf-libero
     retry_cmd libero-download-assets --skip-existing
     reset_libero_config
+}
+
+install_liberosafety_env() {
+    local source_root="${LIBERO_SAFETY_PATH:-$(dirname "$(dirname "$SCRIPT_DIR")")/LIBERO-Safety}"
+    if [ ! -f "${source_root}/setup.py" ]; then
+        echo "LIBERO-Safety source not found at ${source_root}. Set LIBERO_SAFETY_PATH." >&2
+        exit 1
+    fi
+
+    # LIBERO-Safety intentionally uses the same `libero` import name. Remove
+    # the standard distribution before installing the requested source tree.
+    uv pip uninstall libero rlinf-libero robosuite || true
+    uv pip install numpy numba scipy pillow opencv-python "mujoco==3.3.7"
+    uv pip install -e "${source_root}/third_party/robosuite-1.4" --no-deps
+    uv pip install -e "${source_root}" --no-deps
+    # bddl 1.0.1 imports future.utils at runtime but does not declare the
+    # dependency in its package metadata.
+    uv pip install "bddl==1.0.1" future easydict "imageio[ffmpeg]" scikit-image usd-core wand
+
+    local config_root="${VIRTUAL_ENV}/share/libero-safety"
+    mkdir -p "$config_root"
+    local benchmark_root="${source_root}/libero/libero"
+    printf '%s\n' \
+        "assets: ${benchmark_root}/assets" \
+        "bddl_files: ${benchmark_root}/bddl_files" \
+        "benchmark_root: ${benchmark_root}" \
+        "datasets: ${source_root}/libero/datasets" \
+        "init_states: ${benchmark_root}/init_files" \
+        > "${config_root}/config.yaml"
+    LIBERO_CONFIG_PATH="$config_root" python -c \
+        'import libero.libero as libero; print("[install.sh] LIBERO-Safety root:", libero.get_libero_path("benchmark_root"))'
+    if ! grep -q 'share/libero-safety' "${VIRTUAL_ENV}/bin/activate"; then
+        {
+            echo
+            echo 'export LIBERO_CONFIG_PATH="${VIRTUAL_ENV}/share/libero-safety"'
+            echo 'export LIBERO_TYPE="safety"'
+        } >> "${VIRTUAL_ENV}/bin/activate"
+    fi
+
+    if [ ! -d "${source_root}/libero/libero/assets" ]; then
+        echo "[install.sh] LIBERO-Safety code installed, but simulator assets are absent."
+        echo "[install.sh] Download and extract assets.zip as described in SAFELIBERO_INTEGRATION.md."
+    fi
 }
 
 install_maniskill_libero_env() {

@@ -1,5 +1,5 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /cpfs/xlab/xujingbo/safety/RLinf
-exec bash evaluations/run_safelibero.sh
+REPO_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec bash "${REPO_PATH}/evaluations/run_safelibero.sh" "$@"

@@ -1,5 +1,5 @@
 defaults:
-  - env/libero_object@env.eval
+  - env/libero_safety@env.eval
   - model/openvla_oft@rollout.model
   - override hydra/job_logging: stdout
   - _self_
@@ -21,7 +21,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "safelibero_object_openvlaoft_eval"
+    experiment_name: "libero_safety_openvlaoft_eval"
     logger_backends: ["tensorboard"]
   max_epochs: 1000
   max_steps: -1
@@ -34,11 +34,10 @@ runner:
 env:
   group_name: "EnvGroup"
   eval:
-    task_suite_name: safelibero_object
-    safety_level: I
-    collision_displacement_threshold: 0.001
+    task_suite_name: obstacle_avoidance
+    safety_level: L0
     rollout_epoch: 1
-    total_num_envs: 200
+    total_num_envs: 250
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 512
@@ -49,14 +48,14 @@ env:
     reset_gripper_open: False
     is_eval: True
     video_cfg:
-      save_video: True
+      save_video: False
       video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:
   sampling_params:
-    do_sample: True
-    temperature_train: 1.6
-    temperature_eval: 1.6
+    do_sample: False
+    temperature_train: 1.0
+    temperature_eval: -1
     top_k: -1
     top_p: 1.0
     repetition_penalty: 1.0
@@ -65,7 +64,8 @@ rollout:
   enable_offload: False
   pipeline_stage_num: 1
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero-object-traj1/"
+    model_path: "/cpfs/xlab/xujingbo/safety/checkpoints/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora"
     model_type: "openvla_oft"
-    unnorm_key: libero_object_no_noops
+    attn_implementation: "sdpa"
+    unnorm_key: libero_130_no_noops_trajall
     max_prompt_length: 128

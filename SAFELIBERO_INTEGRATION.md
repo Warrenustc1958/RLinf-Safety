@@ -1,68 +1,161 @@
-# SafeLIBERO integration
+# LIBERO-Safety integration
 
-This branch adds SafeLIBERO evaluation support to RLinf's LIBERO environment.
-SafeLIBERO itself is kept as a separate source tree and must be installed into
-the same Python environment before running these configurations.
+This integration runs OpenVLA-OFT evaluation and RL rollouts in the official
+`LIBERO-Safety` simulator. The source checkout and Python environment live next
+to `RLinf`, so simulator assets and dependencies do not enter the RLinf tree.
 
-## Evaluation
+The supported simulator suites are `affordance`, `human_safety`,
+`obstacle_avoidance`, and `obstacle_avoidance_human`. Each suite contains five
+tasks at each of `L0`, `L1`, and `L2`. The repository also registers
+`reasoning_safety`, but it has no simulator init-state directory and is not a
+robot rollout suite.
 
-The launcher accepts `goal`, `object`, `spatial`, `long`, or `libero_10`.
-SafeLIBERO calls the four LIBERO-10-derived long-horizon tasks
-`safelibero_long`; `long` and `libero_10` therefore select the same suite.
+## Install
 
-```bash
-cd /path/to/RLinf
-SUITE=goal SAFETY_LEVEL=I TOTAL_ENVS=40 GPU_RANKS=0-3 \
-  bash run_safelibero.sh
+Assume this layout:
 
-# Full Object evaluation: four tasks x 50 held-out states
-SUITE=object SAFETY_LEVEL=II TOTAL_ENVS=200 GPU_RANKS=0-3 \
-  bash run_safelibero.sh
+```text
+/path/to/workspace/
+├── RLinf/
+├── LIBERO-Safety/
+├── checkpoints/
+└── .venv-openvlaoft-libero-safety/
 ```
 
-The local launcher defaults to a Goal-specific full SFT checkpoint for Goal.
-For Object, Spatial, and Long it defaults to the LIBERO-130 base checkpoint
-plus its LoRA adapter. Override `MODEL`, `UNNORM_KEY`, `IS_LORA`, and
-`LORA_PATH` when using another checkpoint. The normalization key must exist in
-the selected checkpoint's `dataset_statistics.json`.
-
-Reported safety metrics include obstacle contact, obstacle displacement,
-first collision step, collision step count, and collision-free task success
-(`safe_success_once`).
-
-## Demonstration collection
-
-SafeLIBERO contains LIBERO's two-stage teleoperation tools:
+Install RLinf, OpenVLA-OFT, and the official simulator into a dedicated venv:
 
 ```bash
-cd /path/to/vlsa-aegis/safelibero
-python scripts/collect_demonstration.py \
-  --device keyboard \
-  --num-demonstration 50 \
-  --bddl-file libero/libero/bddl_files/safelibero_goal/put_the_bowl_on_the_plate.bddl \
-  --directory demonstration_data
+cd /path/to/workspace/RLinf
+export LIBERO_SAFETY_PATH=/path/to/workspace/LIBERO-Safety
 
-python scripts/create_dataset.py \
-  --demo-file demonstration_data/<run>/demo.hdf5 \
-  --use-camera-obs
+bash requirements/install.sh embodied \
+  --model openvla-oft \
+  --env liberosafety \
+  --venv ../.venv-openvlaoft-libero-safety \
+  --use-mirror \
+  --no-root \
+  --no-flash-attn
 ```
 
-`collect_demonstration.py` records raw simulator states and actions;
-`create_dataset.py` deterministically replays them and writes LIBERO HDF5
-observations (`agentview_rgb`, wrist RGB, proprioception, states, and actions).
+``--no-root`` is appropriate for a managed image that already contains the
+EGL/MuJoCo system libraries; it also avoids changing a shared machine's apt
+state. The supplied LIBERO-Safety configs use PyTorch SDPA, so
+``--no-flash-attn`` does not require another override. The installer
+deliberately does not install
+`LIBERO-Safety/requirements.txt`: its old exact pins would downgrade the
+RLinf/OpenVLA-OFT stack. It installs the official source tree and its bundled
+robosuite fork without dependencies, then adds only the missing runtime
+packages.
 
-For safety training, do not treat the stock collector's output as
-collision-free automatically. The stock script accepts task success but does
-not reject obstacle contact or displacement, and its random reset does not
-select a SafeLIBERO Level-I/II held-out state. A production collector should:
+The official simulator assets are a separate 10.7 GB download. Download the
+archive beside the repositories, then extract it exactly where LIBERO-Safety
+expects `assets/`:
 
-1. generate a separate training set of initial states for each safety level;
-2. reject demonstrations with obstacle contact or displacement;
-3. retain rejected/colliding rollouts separately as negative reward-model data;
-4. store suite, task, level, seed, obstacle pose, success, and collision labels;
-5. reserve the repository's 50 `*.pruned_init` states per task for evaluation.
+```bash
+source /path/to/workspace/.venv-openvlaoft-libero-safety/bin/activate
+hf download LIBERO-Safety/libero_safety_assets assets.zip \
+  --repo-type dataset \
+  --local-dir /path/to/workspace/LIBERO-Safety-assets
 
-After collection, convert only the collision-free expert split to the RLDS
-schema expected by OpenVLA-OFT and compute a new dataset-statistics key, for
-example `safelibero_goal_level_i_no_noops`. Do not reuse a LIBERO normalization
-key after action statistics have changed.
+unzip /path/to/workspace/LIBERO-Safety-assets/assets.zip \
+  -d /path/to/workspace/LIBERO-Safety/libero/libero/
+test -d /path/to/workspace/LIBERO-Safety/libero/libero/assets
+```
+
+The installer puts LIBERO's config under the venv at
+`.venv-openvlaoft-libero-safety/share/libero-safety/config.yaml`. This avoids
+cross-contamination from the global `~/.libero/config.yaml` used by other
+LIBERO forks.
+
+Verify the package, benchmark, and paths before allocating GPUs:
+
+```bash
+export LIBERO_CONFIG_PATH=/path/to/workspace/.venv-openvlaoft-libero-safety/share/libero-safety
+python - <<'PY'
+import libero.libero as libero
+from libero.libero.benchmark import get_benchmark
+
+suite = get_benchmark("obstacle_avoidance")()
+task = suite.get_task_by_level_id(0, 0)
+print("benchmark root:", libero.get_libero_path("benchmark_root"))
+print("tasks:", suite.get_task_distribution_by_level())
+print("BDDL:", suite.get_task_bddl_file_path(0, 0))
+print("init states:", len(suite.get_task_init_states(0, 0)))
+print("first task:", task.language)
+PY
+```
+
+## Evaluate OpenVLA-OFT
+
+The launcher defaults Ray and process temporary files to
+`/root/.cache/rlinf/libero-safety` instead of the container's small `/tmp`
+filesystem. Set `RLINF_RUNTIME_DIR` to another filesystem with sufficient free
+space when required.
+
+`run_safelibero.sh` accepts all paths through environment variables. The
+default model is the local RLinf LIBERO-130 base-plus-LoRA checkpoint; replace
+it with a LIBERO-Safety-finetuned checkpoint when available.
+
+```bash
+cd /path/to/workspace/RLinf
+MODE=eval \
+SUITE=obstacle_avoidance \
+LEVEL=L1 \
+GPU_RANKS=0-3 \
+TOTAL_ENVS=250 \
+MODEL=/path/to/checkpoint \
+IS_LORA=True \
+LORA_PATH=/path/to/checkpoint/lora_adapter \
+UNNORM_KEY=libero_130_no_noops_trajall \
+bash run_safelibero.sh
+```
+
+There are normally 250 held-out episodes per suite and level (five tasks times
+50 init states), so `TOTAL_ENVS=250` evaluates the complete split in one wave.
+For a smoke test, use `TOTAL_ENVS=4` and optionally select one global task id:
+
+```bash
+MODE=eval SUITE=affordance LEVEL=L0 TOTAL_ENVS=4 GPU_RANKS=0 \
+  bash run_safelibero.sh env.eval.task_id_filter='[0]'
+```
+
+## Run RL rollouts / GRPO
+
+The rollout mode uses the same simulator adapter and OpenVLA-OFT action path,
+and adds the actor worker for GRPO updates:
+
+```bash
+cd /path/to/workspace/RLinf
+MODE=rollout \
+SUITE=obstacle_avoidance_human \
+LEVEL=L2 \
+GPU_RANKS=0-3 \
+MODEL=/path/to/checkpoint \
+IS_LORA=True \
+LORA_PATH=/path/to/checkpoint/lora_adapter \
+UNNORM_KEY=libero_130_no_noops_trajall \
+bash run_safelibero.sh
+```
+
+The environment reward comes from the task's BDDL goal predicates. For
+OpenVLA-OFT, `UNNORM_KEY` must exist in the checkpoint's
+`dataset_statistics.json`. Reusing LIBERO-130 statistics is suitable for a
+zero-shot smoke test because the action space is the same, but training on a
+new LIBERO-Safety demonstration set should compute and use its own action
+statistics key.
+
+## Adapter behavior
+
+RLinf still exposes the environment as `env_type: libero`. Setting
+`LIBERO_TYPE=safety` selects the installed official fork. The adapter then:
+
+1. validates the four physical suites and `L0`–`L2`;
+2. filters the benchmark's 15 tasks to the five tasks at the requested level;
+3. resolves BDDL files through the official level-aware API;
+4. loads init states through `get_task_init_states(level, level_id)`;
+5. sends the standard 256×256 agent-view image, proprioceptive state, language
+   instruction, and 7-D actions through RLinf's existing OpenVLA-OFT path.
+
+The official BDDL predicates define success and safety semantics. The adapter
+does not invent a generic collision metric, because collision meaning differs
+between affordance, human-contact, obstacle, and semantic tasks.
