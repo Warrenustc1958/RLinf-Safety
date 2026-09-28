@@ -30,7 +30,15 @@ class FSDPVlaSftWorker(FSDPSftWorker):
 
     def build_dataloader(self, data_paths: Any, eval_dataset: bool = False):
         model_type = SupportedModel(self.cfg.actor.model.model_type)
-        if model_type == SupportedModel.OPENPI_RLINF:
+        if model_type == SupportedModel.OPENVLA_OFT:
+            from rlinf.data.datasets.openvla_oft import (
+                build_openvla_oft_sft_dataloader,
+            )
+
+            return build_openvla_oft_sft_dataloader(
+                self.cfg, self._world_size, self._rank, data_paths, eval_dataset
+            )
+        elif model_type == SupportedModel.OPENPI_RLINF:
             from rlinf.data.datasets.openpi_rlinf import (
                 build_openpi_rlinf_sft_dataloader,
             )

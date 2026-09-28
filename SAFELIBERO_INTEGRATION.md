@@ -159,3 +159,36 @@ RLinf still exposes the environment as `env_type: libero`. Setting
 The official BDDL predicates define success and safety semantics. The adapter
 does not invent a generic collision metric, because collision meaning differs
 between affordance, human-contact, obstacle, and semantic tasks.
+
+## Fine-tune OpenVLA-OFT on the demonstrations
+
+The demonstration release is a LeRobot-v2 tree. Its parquet files contain
+state, 7-D delta action, timestamps, and task indices; RGB observations are not
+embedded in parquet. The two image features in `meta/info.json` point to one
+agent-view and one wrist-view MP4 per episode. The OpenVLA-OFT LIBERO recipe
+uses the agent view only, so the wrist videos are optional unless
+`data.video_keys` is changed to request them.
+
+Start with a short loader/training smoke test:
+
+```bash
+cd /path/to/workspace/RLinf
+DATASET=/path/to/workspace/datasets/libero_safety \
+MODEL=/path/to/workspace/checkpoints/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora \
+bash examples/sft/run_safelibero_openvlaoft.sh \
+  runner.max_steps=2 runner.save_interval=2 \
+  actor.global_batch_size=8 actor.micro_batch_size=1 \
+  data.max_episodes=16
+```
+
+The loader forms an eight-step future action chunk, normalizes its first six
+dimensions with `meta/stats.json` q01/q99 bounds, leaves the binary gripper
+dimension unchanged, and applies action-token cross entropy. It continues the
+LIBERO-130 LoRA adapter by default. Set `actor.model.lora_path=null` to create a
+fresh adapter instead.
+
+Partial video downloads are accepted when
+`data.require_complete_videos=true`: startup logs the number of usable episodes
+and indexes only those whose requested video files exist. This is useful for a
+smoke test, but a full-data run needs every `observation.image` MP4. The wrist
+half of the video release is not needed by the default one-camera checkpoint.

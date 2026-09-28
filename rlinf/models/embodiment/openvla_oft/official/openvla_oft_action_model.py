@@ -575,8 +575,23 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
+        elif forward_type == ForwardType.SFT:
+            return self.sft_forward(**kwargs)
         else:
             raise NotImplementedError
+
+    def sft_forward(self, data, **kwargs):
+        """Compute action-token cross entropy for an OpenVLA-OFT SFT batch."""
+        device = next(self.parameters()).device
+        precision = next(self.parameters()).dtype
+        output = super().forward(
+            input_ids=data["input_ids"].to(device),
+            attention_mask=data["attention_mask"].to(device),
+            pixel_values=data["pixel_values"].to(device=device, dtype=precision),
+            labels=data["labels"].to(device),
+            return_dict=True,
+        )
+        return {"loss": output.loss}
 
     def default_forward(
         self,

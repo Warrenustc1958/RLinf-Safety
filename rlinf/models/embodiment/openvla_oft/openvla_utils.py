@@ -175,19 +175,35 @@ def apply_film_to_vla(vla: torch.nn.Module, cfg) -> torch.nn.Module:
     return vla
 
 
-def load_dataset_stats(cfg: DictConfig) -> None:
+def load_dataset_stats(cfg: DictConfig) -> dict[str, Any]:
     """
     Load dataset statistics for action normalization.
 
     Args:
         cfg: Configuration object with model parameters
     """
-    norm_stats = cfg.get("norm_stats", {})
-    dataset_statistics_path = os.path.join(cfg.model_path, "dataset_statistics.json")
-    if os.path.isfile(dataset_statistics_path):
-        with open(dataset_statistics_path, "r") as f:
+    norm_stats = {}
+    paths = [os.path.join(cfg.model_path, "dataset_statistics.json")]
+    if cfg.get("dataset_statistics_path"):
+        paths.append(str(cfg.dataset_statistics_path))
+    for dataset_statistics_path in paths:
+        if not os.path.isfile(dataset_statistics_path):
+            continue
+        with open(dataset_statistics_path) as f:
             new_norm_stats = json.load(f)
-            norm_stats.update(new_norm_stats)
+        # LeRobot v2 stores raw features at the top level. Convert that file
+        # directly so users do not need to create a second statistics artifact.
+        if "actions" in new_norm_stats:
+            action = dict(new_norm_stats["actions"])
+            mask = [True] * len(action["mean"])
+            if mask:
+                mask[-1] = False
+            converted = {"action": {**action, "mask": mask}}
+            if "observation.state" in new_norm_stats:
+                converted["proprio"] = new_norm_stats["observation.state"]
+            new_norm_stats = {str(cfg.unnorm_key): converted}
+        norm_stats.update(new_norm_stats)
+    norm_stats.update(dict(cfg.get("norm_stats", {})))
     if norm_stats == {}:
         raise ValueError("No dataset statistics found for the given model checkpoint!")
     return norm_stats

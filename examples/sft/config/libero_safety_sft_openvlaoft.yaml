@@ -1,0 +1,86 @@
+defaults:
+  - model/openvla_oft@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: ../results
+    project_name: rlinf
+    experiment_name: libero_safety_sft_openvlaoft
+    logger_backends: [tensorboard]
+  max_epochs: -1
+  max_steps: 10000
+  val_check_interval: -1
+  save_interval: 1000
+  resume_dir: null
+
+data:
+  train_data_paths: /cpfs/xlab/xujingbo/safety/datasets/libero_safety
+  # OpenVLA-OFT LIBERO checkpoints use only the agent-view camera.
+  video_keys: [observation.image]
+  # A partial Hugging Face download remains usable: only episodes with every
+  # requested video are indexed, and coverage is logged during startup.
+  require_complete_videos: true
+  max_episodes: null
+  num_workers: 2
+  parquet_cache_size: 8
+  video_cache_size: 4
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 2
+  global_batch_size: 64
+  seed: 42
+  enable_offload: false
+
+  model:
+    implement_version: rlinf
+    model_path: /cpfs/xlab/xujingbo/safety/checkpoints/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora
+    dataset_statistics_path: ${data.train_data_paths}/meta/stats.json
+    unnorm_key: libero_safety
+    num_action_chunks: 8
+    num_images_in_input: 1
+    use_proprio: false
+    add_value_head: false
+    attn_implementation: sdpa
+    # Continue from the public LIBERO-130 adapter and update only its LoRA weights.
+    is_lora: true
+    lora_path: ${actor.model.model_path}/lora_adapter
+
+  optim:
+    lr: 2.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-8
+    weight_decay: 0.01
+    clip_grad: 1.0
+    warmup_style: cosine
+    lr_warmup_steps: 500
+    total_training_steps: ${runner.max_steps}
+
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: full_shard
+    # LoRA leaves frozen and trainable parameters interleaved.
+    use_orig_params: true
+    gradient_checkpointing: true
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}

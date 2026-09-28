@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-import os
-
 import torch
 from omegaconf import DictConfig
 from transformers import (
@@ -73,18 +70,14 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         cfg.model_path, trust_remote_code=cfg.trust_remote_code
     )
 
-    dataset_statistics_path = os.path.join(cfg.model_path, "dataset_statistics.json")
-    if os.path.isfile(dataset_statistics_path):
-        with open(dataset_statistics_path, "r") as f:
-            new_norm_stats = json.load(f)
-            norm_stats = getattr(actor_model_config, "norm_stats", {})
-            norm_stats.update(new_norm_stats)
-            setattr(actor_model_config, "norm_stats", norm_stats)
-
     override_config_kwargs = cfg
     if override_config_kwargs is not None:
         for key, val in override_config_kwargs.items():
             setattr(actor_model_config, key, val)
+
+    from rlinf.models.embodiment.openvla_oft.openvla_utils import load_dataset_stats
+
+    setattr(actor_model_config, "norm_stats", load_dataset_stats(cfg))
 
     model = OpenVLAOFTForRLActionPrediction.from_pretrained(
         pretrained_model_name_or_path=cfg.model_path,

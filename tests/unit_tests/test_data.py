@@ -24,6 +24,10 @@ import pytest
 import torch
 from omegaconf import DictConfig
 
+from rlinf.data.datasets.openvla_oft import (
+    discover_openvla_episodes,
+    openvla_action_stats,
+)
 from rlinf.data.datasets.reasoning.dataset import ReasoningDataset
 from rlinf.data.schema.embodied_trajectory_builder import EmbodiedTrajectoryBuilder
 from rlinf.data.storage.lerobot import add_frame_to_dataset, episode_boundaries
@@ -37,6 +41,61 @@ from rlinf.utils.obs_compression import (
     is_compressed_image,
     is_compression_enabled,
 )
+
+
+def test_openvla_oft_lerobot_episode_discovery_skips_missing_video(tmp_path):
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    info = {
+        "total_episodes": 2,
+        "chunks_size": 1000,
+        "video_path": (
+            "videos/chunk-{episode_chunk:03d}/{video_key}/"
+            "episode_{episode_index:06d}.mp4"
+        ),
+    }
+    (root / "meta" / "info.json").write_text(json.dumps(info))
+    episodes = [
+        {"episode_index": 0, "tasks": ["task zero"], "length": 10},
+        {"episode_index": 1, "tasks": ["task one"], "length": 12},
+    ]
+    (root / "meta" / "episodes.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in episodes)
+    )
+    video = root / "videos/chunk-000/observation.image/episode_000000.mp4"
+    video.parent.mkdir(parents=True)
+    video.touch()
+
+    selected, total = discover_openvla_episodes(
+        root,
+        video_keys=["observation.image"],
+        action_horizon=8,
+    )
+
+    assert total == 2
+    assert [(ep.index, ep.length, ep.task) for ep in selected] == [(0, 10, "task zero")]
+
+
+def test_openvla_action_stats_preserves_binary_gripper(tmp_path):
+    meta = tmp_path / "meta"
+    meta.mkdir()
+    stats = {
+        "actions": {
+            "mean": [0.0, 0.0, 0.0],
+            "std": [1.0, 1.0, 1.0],
+            "min": [-2.0, -2.0, -1.0],
+            "max": [2.0, 2.0, 1.0],
+            "q01": [-1.0, -1.0, -1.0],
+            "q99": [1.0, 1.0, 1.0],
+        },
+        "observation.state": {"mean": [0.0], "std": [1.0]},
+    }
+    (meta / "stats.json").write_text(json.dumps(stats))
+
+    converted = openvla_action_stats(tmp_path)
+
+    assert converted["action"]["mask"] == [True, True, False]
+    assert converted["action"]["q99"] == [1.0, 1.0, 1.0]
 
 
 class TestMathDatasetMultithread:
