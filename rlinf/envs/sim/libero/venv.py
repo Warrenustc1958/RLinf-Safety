@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional, Union
 import gym
 import numpy as np
 
+from rlinf.envs.sim.libero.safety_auditor import audit_predicate_instances
 from rlinf.envs.sim.libero.utils import get_libero_type
 from rlinf.envs.venv import (
     BaseVectorEnv,
@@ -163,10 +164,17 @@ def _worker(
                 break
             if cmd == "step":
                 env_return = env.step(data)
-                if os.environ.get("LIBERO_TYPE", "standard").lower() == "safe":
+                current_libero_type = os.environ.get("LIBERO_TYPE", "standard").lower()
+                if current_libero_type == "safe":
                     env_return = list(env_return)
                     info = dict(env_return[3])
                     info["_safelibero_contact_pairs"] = _get_contact_pairs(env)
+                    env_return[3] = info
+                    env_return = tuple(env_return)
+                elif current_libero_type == "safety":
+                    env_return = list(env_return)
+                    info = dict(env_return[3])
+                    info["_libero_safety_predicates"] = audit_predicate_instances(env)
                     env_return[3] = info
                     env_return = tuple(env_return)
                 if obs_bufs is not None:

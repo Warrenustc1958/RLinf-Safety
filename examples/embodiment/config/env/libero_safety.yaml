@@ -27,3 +27,11 @@ video_cfg:
 init_params:
   camera_heights: 256
   camera_widths: 256
+
+# When enabled, violations are recorded but do not end the episode. The emitted
+# termination follows raw task success; official LIBERO-Safety termination is
+# retained in every JSON transition for later comparison.
+episode_auditor:
+  enabled: false
+  save_dir: ${runner.logger.log_path}/libero_safety_audits
+  include_observations: true

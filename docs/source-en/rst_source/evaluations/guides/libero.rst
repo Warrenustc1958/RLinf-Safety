@@ -280,6 +280,23 @@ Advanced Usage
      env.eval.total_num_envs=64 \
      rollout.model.model_path=/path/to/model
 
+LIBERO-Safety episode auditing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The optional LIBERO-Safety auditor writes one atomic JSON file per episode while keeping raw task success independent from safety violations. In audit mode a violation is still reported as both a step-level signal and the official LIBERO-Safety termination, but the emitted environment termination remains false until raw task success or the horizon. This continuation is for data collection only; leave the auditor disabled for official benchmark evaluation.
+
+.. code-block:: yaml
+
+   env:
+     eval:
+       ignore_terminations: false
+       episode_auditor:
+         enabled: true
+         save_dir: ${runner.logger.log_path}/libero_safety_audits
+         include_observations: true
+
+Each transition contains ``raw_task``, ``safety_violation``, ``official``, and ``emitted`` termination flags plus every goal and constraint predicate instance. Repeated predicate names remain separate through stable instance IDs such as ``constraint:000``. Episode summaries include the first violation timestep and the Q1–Q4 outcome. ``include_observations`` stores all non-visual simulator observations; image arrays remain in the normal video or episode collector rather than being embedded in JSON. The normative schema is ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``.
+
 FAQ
 ---
 

@@ -278,6 +278,23 @@ RLinf 的 ``evaluations/libero/`` 示例覆盖上述四个 ``task_suite_name``�
      env.eval.total_num_envs=64 \
      rollout.model.model_path=/path/to/model
 
+LIBERO-Safety episode 审计
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+可选的 LIBERO-Safety auditor 为每个 episode 原子写入一个 JSON 文件，并独立保留 raw task success 与 safety violation。审计模式下，violation 仍作为逐步安全终止信号和 LIBERO-Safety 正式终止信号记录，但环境实际发出的 termination 在 raw task success 或 horizon 之前保持为 false。该继续执行语义只用于数据采集；正式 benchmark 评测应保持 auditor 关闭。
+
+.. code-block:: yaml
+
+   env:
+     eval:
+       ignore_terminations: false
+       episode_auditor:
+         enabled: true
+         save_dir: ${runner.logger.log_path}/libero_safety_audits
+         include_observations: true
+
+每个 transition 都包含 ``raw_task``、``safety_violation``、``official`` 和 ``emitted`` 四个 termination 标记，并逐实例保存所有 goal 与 constraint predicate。同名 predicate 通过 ``constraint:000`` 等稳定 instance ID 分别保留。Episode summary 包含第一次 violation timestep 和 Q1–Q4 象限。``include_observations`` 保存所有非视觉 simulator observation；图像数组仍由常规 video 或 episode collector 保存，不嵌入 JSON。规范 schema 位于 ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``。
+
 常见问题
 --------
 

@@ -25,6 +25,7 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.sim.libero.safety_auditor import LiberoSafetyEpisodeAuditor
 from rlinf.envs.sim.libero.utils import (
     build_interleaved_eval_reset_state_ids,
     distribute_reset_state_ids_round_robin,
@@ -232,6 +233,29 @@ class LiberoEnv(gym.Env):
         self.skip_intermediate_renders = bool(
             OmegaConf.select(cfg, "skip_intermediate_renders", default=False)
         )
+        auditor_cfg = OmegaConf.select(cfg, "episode_auditor", default=None)
+        auditor_enabled = bool(
+            auditor_cfg is not None and auditor_cfg.get("enabled", False)
+        )
+        if auditor_enabled and self.libero_type != "safety":
+            raise ValueError(
+                "episode_auditor is only supported with LIBERO_TYPE=safety"
+            )
+        if auditor_enabled and self.ignore_terminations:
+            raise ValueError(
+                "episode_auditor owns continuation semantics; "
+                "set ignore_terminations=false"
+            )
+        self.episode_auditor = None
+        if auditor_enabled:
+            self.episode_auditor = LiberoSafetyEpisodeAuditor(
+                save_dir=str(auditor_cfg.save_dir),
+                process_id=self.seed_offset,
+                num_envs=self.num_envs,
+                include_observations=bool(
+                    auditor_cfg.get("include_observations", True)
+                ),
+            )
 
     def _log_evaluation_mode(self):
         """Log the LIBERO evaluation mode banner (rank 0 env worker only)."""
@@ -778,6 +802,8 @@ class LiberoEnv(gym.Env):
 
     def _init_metrics(self):
         self.success_once = np.zeros(self.num_envs, dtype=bool)
+        self.raw_task_success_once = np.zeros(self.num_envs, dtype=bool)
+        self.first_raw_task_success_step = np.full(self.num_envs, -1, dtype=np.int32)
         self.fail_once = np.zeros(self.num_envs, dtype=bool)
         self.returns = np.zeros(self.num_envs)
         self.success_episode_len = np.zeros(self.num_envs, dtype=np.int32)
@@ -795,6 +821,8 @@ class LiberoEnv(gym.Env):
             mask[env_idx] = True
             self.prev_step_reward[mask] = 0.0
             self.success_once[mask] = False
+            self.raw_task_success_once[mask] = False
+            self.first_raw_task_success_step[mask] = -1
             self.fail_once[mask] = False
             self.returns[mask] = 0
             self.success_episode_len[mask] = 0
@@ -807,6 +835,8 @@ class LiberoEnv(gym.Env):
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
+            self.raw_task_success_once[:] = False
+            self.first_raw_task_success_step[:] = -1
             self.fail_once[:] = False
             self.returns[:] = 0.0
             self.success_episode_len[:] = 0
@@ -888,23 +918,31 @@ class LiberoEnv(gym.Env):
         }
 
     @staticmethod
-    def _constraint_violations(info_lists):
-        """Return LIBERO-Safety's per-environment UBDDL constraint violations."""
-        return np.asarray(
-            [
-                any(bool(value) for value in info.get("cost", {}).values())
-                for info in info_lists
-            ],
-            dtype=bool,
-        )
+    def _constraint_violations(predicate_audits, info_lists):
+        """Return per-environment violations without collapsing predicates."""
+        violations = []
+        for predicates, info in zip(predicate_audits, info_lists):
+            if predicates:
+                violations.append(
+                    any(
+                        predicate["source"] == "constraint" and bool(predicate["value"])
+                        for predicate in predicates
+                    )
+                )
+            else:
+                violations.append(
+                    any(bool(value) for value in info.get("cost", {}).values())
+                )
+        return np.asarray(violations, dtype=bool)
 
     def _record_metrics(
         self,
         step_reward,
-        terminations,
+        safe_goal_terminations,
         infos,
         safety_events=None,
         constraint_violations=None,
+        raw_goal_terminations=None,
     ):
         episode_info = {}
         if safety_events is None:
@@ -918,6 +956,9 @@ class LiberoEnv(gym.Env):
         if constraint_violations is None:
             constraint_violations = np.zeros(self.num_envs, dtype=bool)
         constraint_violations = np.asarray(constraint_violations, dtype=bool)
+        if raw_goal_terminations is None:
+            raw_goal_terminations = safe_goal_terminations
+        raw_goal_terminations = np.asarray(raw_goal_terminations, dtype=bool)
         if self.libero_type == "safety":
             collision = constraint_violations
         active_collision = collision & ~self.success_once
@@ -930,14 +971,23 @@ class LiberoEnv(gym.Env):
         # Only accumulate returns while not yet succeeded
         self.returns += step_reward * (~self.success_once)
         # Record episode_len at first success
-        new_success_mask = terminations & ~self.success_once
+        new_raw_success = raw_goal_terminations & ~self.raw_task_success_once
+        self.first_raw_task_success_step[new_raw_success] = self.elapsed_steps[
+            new_raw_success
+        ]
+        self.raw_task_success_once |= raw_goal_terminations
+        new_success_mask = safe_goal_terminations & ~self.success_once
         if new_success_mask.any():
             self.success_episode_len[new_success_mask] = self.elapsed_steps[
                 new_success_mask
             ]
 
-        self.success_once = self.success_once | terminations
+        self.success_once = self.success_once | safe_goal_terminations
         episode_info["success_once"] = self.success_once.copy()
+        episode_info["raw_task_success_once"] = self.raw_task_success_once.copy()
+        episode_info["first_raw_task_success_step"] = (
+            self.first_raw_task_success_step.copy()
+        )
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
         if self.libero_type in {"safe", "safety"}:
@@ -948,6 +998,7 @@ class LiberoEnv(gym.Env):
             episode_info["collision_once_contact"] = self.collision_once_contact.copy()
             episode_info["collision_step_count"] = self.collision_step_count.copy()
             episode_info["first_collision_step"] = self.first_collision_step.copy()
+            episode_info["safety_violation_once"] = self.collision_once.copy()
             episode_info["safe_success_once"] = self.success_once & ~self.collision_once
 
         # Use success episode_len for reward if already succeeded, else current elapsed
@@ -1034,6 +1085,24 @@ class LiberoEnv(gym.Env):
             init_state = self._get_reset_states(env_idx=env_idx)
             self.env.set_init_state(init_state=init_state, id=env_idx)
 
+    def _start_auditor_episodes(self, env_idx, reset_state_ids, raw_obs):
+        """Initialize per-environment audit records after reset settling."""
+        if self.episode_auditor is None:
+            return
+        for local_idx, env_id in enumerate(env_idx):
+            self.episode_auditor.start_episode(
+                int(env_id),
+                metadata={
+                    "task_suite": str(self.cfg.task_suite_name),
+                    "safety_level": f"L{self.safety_level}",
+                    "task_id": int(self.task_ids[env_id]),
+                    "trial_id": int(self.trial_ids[env_id]),
+                    "reset_state_id": int(reset_state_ids[local_idx]),
+                    "instruction": str(self.task_descriptions[env_id]),
+                },
+                initial_observation=raw_obs[local_idx],
+            )
+
     def reset(
         self,
         env_idx: Optional[Union[int, list[int], np.ndarray]] = None,
@@ -1078,6 +1147,7 @@ class LiberoEnv(gym.Env):
         self._reset_safety_state(env_idx, raw_obs, info_lists)
         obs = self._wrap_obs(self.current_raw_obs)
         self._reset_metrics(env_idx)
+        self._start_auditor_episodes(env_idx, reset_state_ids, raw_obs)
         infos = {}
         return obs, infos
 
@@ -1123,15 +1193,27 @@ class LiberoEnv(gym.Env):
         raw_obs, _reward, goal_terminations, info_lists = self.env.step(actions)
         self.current_raw_obs = raw_obs
         safety_events = self._compute_safety_events(raw_obs, info_lists)
+        predicate_audits = [
+            info.pop("_libero_safety_predicates", []) for info in info_lists
+        ]
+        raw_goal_terminations = np.asarray(goal_terminations, dtype=bool)
         constraint_violations = (
-            self._constraint_violations(info_lists)
+            self._constraint_violations(predicate_audits, info_lists)
             if self.libero_type == "safety"
             else np.zeros(self.num_envs, dtype=bool)
         )
         # The LIBERO-Safety protocol counts success only when the goal is reached
         # without a constraint violation and terminates immediately on violation.
-        safe_goal_terminations = np.asarray(goal_terminations, dtype=bool) & ~constraint_violations
-        terminations = safe_goal_terminations | constraint_violations
+        safe_goal_terminations = raw_goal_terminations & ~constraint_violations
+        official_terminations = safe_goal_terminations | constraint_violations
+        # Audit collection continues through violations and ends at raw task
+        # success or horizon. The official protocol remains unchanged when the
+        # auditor is disabled.
+        terminations = (
+            raw_goal_terminations.copy()
+            if self.episode_auditor is not None
+            else official_terminations.copy()
+        )
         infos = list_of_dict_to_dict_of_list(info_lists)
         truncations = self.elapsed_steps >= self.cfg.max_episode_steps
         obs = None if _skip_obs_wrap else self._wrap_obs(raw_obs)
@@ -1144,10 +1226,35 @@ class LiberoEnv(gym.Env):
             infos,
             safety_events=safety_events,
             constraint_violations=constraint_violations,
+            raw_goal_terminations=raw_goal_terminations,
         )
+        infos["terminations"] = to_tensor(
+            {
+                "raw_task": raw_goal_terminations,
+                "safety_violation": constraint_violations,
+                "official": official_terminations,
+                "emitted": terminations,
+            }
+        )
+        if self.episode_auditor is not None:
+            for env_id in range(self.num_envs):
+                self.episode_auditor.record_transition(
+                    env_id,
+                    timestep=int(self.elapsed_steps[env_id]),
+                    action=actions[env_id],
+                    observation=raw_obs[env_id],
+                    reward=step_reward[env_id],
+                    raw_task_termination=bool(raw_goal_terminations[env_id]),
+                    safety_violation_termination=bool(constraint_violations[env_id]),
+                    official_termination=bool(official_terminations[env_id]),
+                    emitted_termination=bool(terminations[env_id]),
+                    truncated=bool(truncations[env_id]),
+                    predicates=predicate_audits[env_id],
+                )
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(safe_goal_terminations)
             terminations[:] = False
+            infos["terminations"]["emitted"] = to_tensor(terminations)
 
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset
@@ -1160,6 +1267,12 @@ class LiberoEnv(gym.Env):
             to_tensor(truncations),
             infos,
         )
+
+    def close(self):
+        """Flush active audit episodes and close simulator subprocesses."""
+        if self.episode_auditor is not None:
+            self.episode_auditor.close()
+        return self.env.close()
 
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]

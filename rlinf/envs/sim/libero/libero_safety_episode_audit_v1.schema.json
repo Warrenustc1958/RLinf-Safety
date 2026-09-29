@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rlinf.readthedocs.io/schemas/libero_safety_episode_audit_v1.schema.json",
+  "title": "LIBERO-Safety episode audit v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "timestep_base",
+    "episode",
+    "trajectory",
+    "outcome"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "libero_safety_episode_audit/v1"
+    },
+    "timestep_base": {
+      "const": 1
+    },
+    "episode": {
+      "type": "object",
+      "required": [
+        "episode_id",
+        "process_id",
+        "env_index",
+        "episode_index",
+        "task_suite",
+        "safety_level",
+        "task_id",
+        "trial_id",
+        "reset_state_id",
+        "instruction"
+      ]
+    },
+    "initial_observation": {},
+    "trajectory": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/transition"
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "required": [
+        "raw_task_success",
+        "safety_violation",
+        "safe_task_success",
+        "quadrant",
+        "first_raw_task_success_timestep",
+        "first_violation_timestep",
+        "end_reason",
+        "num_transitions"
+      ],
+      "properties": {
+        "raw_task_success": {"type": "boolean"},
+        "safety_violation": {"type": "boolean"},
+        "safe_task_success": {"type": "boolean"},
+        "quadrant": {"enum": ["Q1", "Q2", "Q3", "Q4"]},
+        "first_raw_task_success_timestep": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "first_violation_timestep": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "end_reason": {
+          "enum": [
+            "raw_task_success",
+            "horizon",
+            "external_reset",
+            "environment_close"
+          ]
+        },
+        "num_transitions": {"type": "integer", "minimum": 1}
+      }
+    }
+  },
+  "$defs": {
+    "predicate": {
+      "type": "object",
+      "required": [
+        "instance_id",
+        "source",
+        "predicate",
+        "arguments",
+        "semantics",
+        "value"
+      ],
+      "properties": {
+        "instance_id": {"type": "string"},
+        "source": {"enum": ["goal", "constraint"]},
+        "predicate": {"type": "string"},
+        "arguments": {"type": "array"},
+        "semantics": {"enum": ["satisfaction", "violation"]},
+        "value": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "transition": {
+      "type": "object",
+      "required": [
+        "timestep",
+        "action",
+        "reward",
+        "terminations",
+        "predicates"
+      ],
+      "properties": {
+        "timestep": {"type": "integer", "minimum": 1},
+        "action": {},
+        "reward": {},
+        "observation": {},
+        "terminations": {
+          "type": "object",
+          "required": [
+            "raw_task",
+            "safety_violation",
+            "official",
+            "emitted",
+            "truncated"
+          ],
+          "properties": {
+            "raw_task": {"type": "boolean"},
+            "safety_violation": {"type": "boolean"},
+            "official": {"type": "boolean"},
+            "emitted": {"type": "boolean"},
+            "truncated": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "predicates": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/predicate"}
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
