@@ -43,6 +43,15 @@ _PALIGEMMA_WIDTH = 2048
 _ACTION_WIDTH = 1024
 
 
+def _unwrap_value_nodes(tree):
+    """Remove NNX's singleton ``value`` wrappers from an Orbax parameter tree."""
+    if isinstance(tree, dict):
+        if tree.keys() == {"value"}:
+            return _unwrap_value_nodes(tree["value"])
+        return {key: _unwrap_value_nodes(value) for key, value in tree.items()}
+    return tree
+
+
 def _load_jax_params(checkpoint_dir: str | pathlib.Path) -> dict:
     """Restore the JAX parameter pytree from ``{checkpoint_dir}/params`` as float32 numpy.
 
@@ -69,6 +78,10 @@ def _load_jax_params(checkpoint_dir: str | pathlib.Path) -> dict:
     restored = jax.tree_util.tree_map(
         lambda x: np.asarray(x, dtype=np.float32), restored
     )
+    # Newer NNX checkpoints store each parameter leaf as
+    # ``{"value": array}``. Normalize that representation once here so every
+    # model component converter sees the same array-only tree.
+    restored = _unwrap_value_nodes(restored)
     # Some orbax checkpoints (e.g. the pi05_base reference) wrap the parameter
     # tree under a top-level ``params`` collection; the converters expect the
     # unwrapped tree (``PaliGemma`` / ``action_in_proj`` / ... at the top), so

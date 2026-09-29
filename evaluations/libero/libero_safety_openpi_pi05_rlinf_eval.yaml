@@ -1,0 +1,68 @@
+defaults:
+  - env/libero_safety@env.eval
+  - model/pi0_5_rlinf@rollout.model
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: all
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_safety_openpi_pi05_rlinf_eval"
+    logger_backends: ["tensorboard"]
+  max_epochs: 1000
+  max_steps: -1
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    auto_reset: True
+    ignore_terminations: False
+    max_episode_steps: 512
+    # Must be divisible by rollout.model.num_action_chunks (5).
+    max_steps_per_rollout_epoch: 515
+    use_fixed_reset_state_ids: True
+    use_ordered_reset_state_ids: True
+    is_eval: True
+    video_cfg:
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  pipeline_stage_num: 1
+  model:
+    model_path: "/path/to/pi05_libero_safety_rlinf"
+    num_action_chunks: 5
+    action_dim: 7
+    num_steps: 5
+    openpi:
+      task: eval
+      config_name: "pi05_libero"
+      num_images_in_input: 2
+      num_steps: 5
+      noise_method: "flow_sde"
+      noise_level: 0.3
+    openpi_data:
+      norm_stats_path: ${..model_path}/assets/lerobot/norm_stats.json

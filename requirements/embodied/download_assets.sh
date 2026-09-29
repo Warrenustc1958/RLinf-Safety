@@ -125,7 +125,7 @@ download_openpi_assets() {
 
 	export TOKENIZER_DIR="${root_dir}/.cache/openpi/"
 
-	if [ -f "$TOKENIZER_DIR/paligemma_tokenizer.model" ]; then
+	if [ -f "$TOKENIZER_DIR/big_vision/paligemma_tokenizer.model" ]; then
 		echo "[download_assets] OpenPI tokenizer already exists at $TOKENIZER_DIR, skipping download."
 	else
 		mkdir -p "$TOKENIZER_DIR"

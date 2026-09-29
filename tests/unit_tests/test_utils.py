@@ -30,7 +30,28 @@ import torch
 from omegaconf import OmegaConf
 
 from rlinf.runners.reasoning_runner import ReasoningRunner
+from rlinf.utils.ckpt_convertor.openpi.jax_to_openpi_rlinf import (
+    _unwrap_value_nodes,
+)
 from rlinf.utils.metric_utils import compute_evaluate_metrics, compute_rollout_metrics
+
+
+def test_openpi_converter_unwraps_nnx_value_nodes():
+    leaf = object()
+    tree = {
+        "params": {
+            "wrapped": {"value": leaf},
+            "ordinary": {"value": leaf, "metadata": "keep"},
+        }
+    }
+
+    unwrapped = _unwrap_value_nodes(tree)
+
+    assert unwrapped["params"]["wrapped"] is leaf
+    assert unwrapped["params"]["ordinary"] == {
+        "value": leaf,
+        "metadata": "keep",
+    }
 
 
 def test_compute_evaluate_metrics_reports_interact_delay_wait_time_stats():
