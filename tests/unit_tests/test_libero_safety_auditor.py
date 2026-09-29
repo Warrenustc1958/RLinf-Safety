@@ -24,6 +24,8 @@ from rlinf.envs.sim.libero.safety_auditor import (
     SCHEMA_VERSION,
     LiberoSafetyEpisodeAuditor,
     audit_predicate_instances,
+    detect_severe_collisions,
+    select_emitted_terminations,
 )
 
 
@@ -85,8 +87,49 @@ def test_predicate_audit_preserves_duplicate_instances():
     assert [predicate["value"] for predicate in predicates] == [True, True, False]
 
 
+def test_shadow_mode_only_emits_raw_success_or_severe_collision():
+    raw_task = np.array([False, True, False])
+    official = np.array([True, True, True])
+    severe = np.array([False, False, True])
+
+    assert select_emitted_terminations(
+        "official_eval", raw_task, official, severe
+    ).tolist() == [True, True, True]
+    assert select_emitted_terminations(
+        "shadow_collect", raw_task, official, severe
+    ).tolist() == [False, True, True]
+
+
+def test_severe_collision_uses_predicate_and_persistence_guards():
+    predicate_audits = [
+        [
+            {
+                "source": "constraint",
+                "predicate": "checkgripperforce",
+                "value": True,
+            }
+        ],
+        [_predicate("constraint:000", True)],
+    ]
+    severe, streak = detect_severe_collisions(
+        predicate_audits=predicate_audits,
+        constraint_violations=np.array([True, True]),
+        consecutive_violation_steps=np.array([0, 7]),
+        hard_stop_predicates={"checkgripperforce"},
+        max_consecutive_violation_steps=8,
+    )
+
+    assert severe.tolist() == [True, True]
+    assert streak.tolist() == [1, 8]
+
+
 def test_auditor_continues_after_violation_and_writes_q2(tmp_path: Path):
-    auditor = LiberoSafetyEpisodeAuditor(tmp_path, process_id=2, num_envs=1)
+    auditor = LiberoSafetyEpisodeAuditor(
+        tmp_path,
+        process_id=2,
+        num_envs=1,
+        mode="shadow_collect",
+    )
     _start(auditor)
     duplicate_predicates = [
         _predicate("constraint:000", True),
@@ -100,11 +143,12 @@ def test_auditor_continues_after_violation_and_writes_q2(tmp_path: Path):
         observation={"robot0_eef_pos": np.array([0.2, 0.2, 0.3])},
         reward=0.0,
         raw_task_termination=False,
-        safety_violation_termination=True,
-        official_termination=True,
+        safety_violation_termination=False,
+        severe_collision_termination=False,
+        official_termination=False,
         emitted_termination=False,
         truncated=False,
-        predicates=duplicate_predicates,
+        predicates=[_predicate("constraint:000", False)],
     )
     second_path = auditor.record_transition(
         0,
@@ -113,11 +157,12 @@ def test_auditor_continues_after_violation_and_writes_q2(tmp_path: Path):
         observation={"robot0_eef_pos": np.array([0.3, 0.2, 0.3])},
         reward=0.0,
         raw_task_termination=False,
-        safety_violation_termination=False,
-        official_termination=False,
+        safety_violation_termination=True,
+        severe_collision_termination=False,
+        official_termination=True,
         emitted_termination=False,
         truncated=False,
-        predicates=[_predicate("constraint:000", False)],
+        predicates=duplicate_predicates,
     )
     output_path = auditor.record_transition(
         0,
@@ -127,6 +172,7 @@ def test_auditor_continues_after_violation_and_writes_q2(tmp_path: Path):
         reward=1.0,
         raw_task_termination=True,
         safety_violation_termination=False,
+        severe_collision_termination=False,
         official_termination=True,
         emitted_termination=True,
         truncated=False,
@@ -141,26 +187,87 @@ def test_auditor_continues_after_violation_and_writes_q2(tmp_path: Path):
 
     assert record["schema_version"] == SCHEMA_VERSION
     assert len(record["trajectory"]) == 3
-    assert len(record["trajectory"][0]["predicates"]) == 2
-    assert record["trajectory"][0]["terminations"] == {
+    assert len(record["trajectory"][1]["predicates"]) == 2
+    assert record["trajectory"][1]["terminations"] == {
         "raw_task": False,
         "safety_violation": True,
+        "severe_collision": False,
         "official": True,
         "emitted": False,
         "truncated": False,
     }
     assert record["outcome"] == {
+        "success": True,
+        "unsafe": True,
         "raw_task_success": True,
         "safety_violation": True,
+        "severe_collision": False,
         "safe_task_success": False,
         "quadrant": "Q2",
         "first_raw_task_success_timestep": 3,
-        "first_violation_timestep": 1,
+        "first_violation_timestep": 2,
+        "first_severe_collision_timestep": None,
         "end_reason": "raw_task_success",
         "num_transitions": 3,
     }
+    assert record["success"] is True
+    assert record["unsafe"] is True
+    assert [step["timestep"] for step in record["trajectory_after_violation"]] == [
+        2,
+        3,
+    ]
     assert "agentview_image" not in record["initial_observation"]
     assert record["initial_observation"]["robot0_eef_pos"] == [0.1, 0.2, 0.3]
+
+
+def test_official_violation_and_shadow_severe_collision_hard_stop(tmp_path: Path):
+    official = LiberoSafetyEpisodeAuditor(
+        tmp_path / "official", process_id=0, num_envs=1
+    )
+    _start(official)
+    official_path = official.record_transition(
+        0,
+        timestep=1,
+        action=[0.0] * 7,
+        observation={},
+        reward=0.0,
+        raw_task_termination=False,
+        safety_violation_termination=True,
+        severe_collision_termination=False,
+        official_termination=True,
+        emitted_termination=True,
+        truncated=False,
+        predicates=[_predicate("constraint:000", True)],
+    )
+    assert official_path is not None
+    official_record = json.loads(official_path.read_text(encoding="utf-8"))
+    assert official_record["outcome"]["end_reason"] == "safety_violation"
+
+    shadow = LiberoSafetyEpisodeAuditor(
+        tmp_path / "shadow",
+        process_id=0,
+        num_envs=1,
+        mode="shadow_collect",
+    )
+    _start(shadow)
+    severe_path = shadow.record_transition(
+        0,
+        timestep=1,
+        action=[0.0] * 7,
+        observation={},
+        reward=0.0,
+        raw_task_termination=False,
+        safety_violation_termination=True,
+        severe_collision_termination=True,
+        official_termination=True,
+        emitted_termination=True,
+        truncated=False,
+        predicates=[_predicate("constraint:000", True)],
+    )
+    assert severe_path is not None
+    severe_record = json.loads(severe_path.read_text(encoding="utf-8"))
+    assert severe_record["outcome"]["end_reason"] == "severe_collision"
+    assert severe_record["outcome"]["severe_collision"] is True
 
 
 def test_auditor_writes_safe_failure_at_horizon(tmp_path: Path):
@@ -180,6 +287,7 @@ def test_auditor_writes_safe_failure_at_horizon(tmp_path: Path):
         reward=0.0,
         raw_task_termination=False,
         safety_violation_termination=False,
+        severe_collision_termination=False,
         official_termination=False,
         emitted_termination=False,
         truncated=True,
@@ -208,6 +316,7 @@ def test_auditor_writes_safe_failure_at_horizon(tmp_path: Path):
         reward=0.0,
         raw_task_termination=False,
         safety_violation_termination=False,
+        severe_collision_termination=False,
         official_termination=False,
         emitted_termination=False,
         truncated=True,

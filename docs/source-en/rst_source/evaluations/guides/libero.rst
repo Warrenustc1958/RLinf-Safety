@@ -283,7 +283,7 @@ Advanced Usage
 LIBERO-Safety episode auditing
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The optional LIBERO-Safety auditor writes one atomic JSON file per episode while keeping raw task success independent from safety violations. In audit mode a violation is still reported as both a step-level signal and the official LIBERO-Safety termination, but the emitted environment termination remains false until raw task success or the horizon. This continuation is for data collection only; leave the auditor disabled for official benchmark evaluation.
+The optional LIBERO-Safety auditor writes one atomic JSON file per episode while keeping raw task success independent from safety violations. It has two explicit modes. ``official_eval`` emits a termination for every violation, matching the benchmark protocol. ``shadow_collect`` records ordinary violations without terminating and continues until raw task success, the horizon, or a severe-collision hard stop. Shadow continuation is for data collection only.
 
 .. code-block:: yaml
 
@@ -292,10 +292,16 @@ The optional LIBERO-Safety auditor writes one atomic JSON file per episode while
        ignore_terminations: false
        episode_auditor:
          enabled: true
+         mode: shadow_collect  # official_eval | shadow_collect
          save_dir: ${runner.logger.log_path}/libero_safety_audits
          include_observations: true
+         severe_collision:
+           hard_stop_predicates: [checkgripperforce]
+           max_consecutive_violation_steps: 8
 
-Each transition contains ``raw_task``, ``safety_violation``, ``official``, and ``emitted`` termination flags plus every goal and constraint predicate instance. Repeated predicate names remain separate through stable instance IDs such as ``constraint:000``. Episode summaries include the first violation timestep and the Q1–Q4 outcome. ``include_observations`` stores all non-visual simulator observations; image arrays remain in the normal video or episode collector rather than being embedded in JSON. The normative schema is ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``.
+By default, a true ``CheckGripperForce`` constraint is severe because LIBERO-Safety already applies its contact-force threshold. Any lower-severity violation that persists for eight consecutive control steps is also promoted to a hard stop. Both rules are configurable under ``severe_collision``.
+
+Each transition contains ``raw_task``, ``safety_violation``, ``severe_collision``, ``official``, and ``emitted`` termination flags plus every goal and constraint predicate instance. Repeated predicate names remain separate through stable instance IDs such as ``constraint:000``. Episode summaries include the first violation timestep and the Q1–Q4 outcome. The top-level ``success`` is raw task success, ``unsafe`` means at least one violation occurred, and ``trajectory_after_violation`` contains the first violating transition and every recorded transition after it. ``include_observations`` stores all non-visual simulator observations; image arrays remain in the normal video or episode collector rather than being embedded in JSON. The normative schema is ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``.
 
 FAQ
 ---

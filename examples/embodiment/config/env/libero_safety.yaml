@@ -28,10 +28,16 @@ init_params:
   camera_heights: 256
   camera_widths: 256
 
-# When enabled, violations are recorded but do not end the episode. The emitted
-# termination follows raw task success; official LIBERO-Safety termination is
-# retained in every JSON transition for later comparison.
+# official_eval emits the benchmark termination on any violation.
+# shadow_collect records ordinary violations and continues until raw task
+# success, horizon, or a severe-collision hard stop.
 episode_auditor:
   enabled: false
+  mode: official_eval  # official_eval | shadow_collect
   save_dir: ${runner.logger.log_path}/libero_safety_audits
   include_observations: true
+  severe_collision:
+    # CheckGripperForce already applies LIBERO-Safety's force threshold.
+    hard_stop_predicates: [checkgripperforce]
+    # Any persistent lower-severity violation is promoted to a hard stop.
+    max_consecutive_violation_steps: 8

@@ -25,7 +25,12 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
-from rlinf.envs.sim.libero.safety_auditor import LiberoSafetyEpisodeAuditor
+from rlinf.envs.sim.libero.safety_auditor import (
+    AUDIT_MODES,
+    LiberoSafetyEpisodeAuditor,
+    detect_severe_collisions,
+    select_emitted_terminations,
+)
 from rlinf.envs.sim.libero.utils import (
     build_interleaved_eval_reset_state_ids,
     distribute_reset_state_ids_round_robin,
@@ -237,6 +242,9 @@ class LiberoEnv(gym.Env):
         auditor_enabled = bool(
             auditor_cfg is not None and auditor_cfg.get("enabled", False)
         )
+        self.episode_auditor_mode = "official_eval"
+        self.severe_collision_predicates = {"checkgripperforce"}
+        self.max_consecutive_violation_steps = 8
         if auditor_enabled and self.libero_type != "safety":
             raise ValueError(
                 "episode_auditor is only supported with LIBERO_TYPE=safety"
@@ -246,6 +254,27 @@ class LiberoEnv(gym.Env):
                 "episode_auditor owns continuation semantics; "
                 "set ignore_terminations=false"
             )
+        if auditor_enabled:
+            self.episode_auditor_mode = str(
+                auditor_cfg.get("mode", "official_eval")
+            ).lower()
+            if self.episode_auditor_mode not in AUDIT_MODES:
+                raise ValueError(
+                    f"episode_auditor.mode must be one of {AUDIT_MODES}, got "
+                    f"{self.episode_auditor_mode!r}"
+                )
+            severe_cfg = auditor_cfg.get("severe_collision", {})
+            self.severe_collision_predicates = {
+                str(name).lower()
+                for name in severe_cfg.get(
+                    "hard_stop_predicates", ["checkgripperforce"]
+                )
+            }
+            self.max_consecutive_violation_steps = int(
+                severe_cfg.get("max_consecutive_violation_steps", 8)
+            )
+            if self.max_consecutive_violation_steps < 1:
+                raise ValueError("max_consecutive_violation_steps must be at least 1")
         self.episode_auditor = None
         if auditor_enabled:
             self.episode_auditor = LiberoSafetyEpisodeAuditor(
@@ -255,6 +284,7 @@ class LiberoEnv(gym.Env):
                 include_observations=bool(
                     auditor_cfg.get("include_observations", True)
                 ),
+                mode=self.episode_auditor_mode,
             )
 
     def _log_evaluation_mode(self):
@@ -812,6 +842,7 @@ class LiberoEnv(gym.Env):
         self.collision_once_contact = np.zeros(self.num_envs, dtype=bool)
         self.collision_step_count = np.zeros(self.num_envs, dtype=np.int32)
         self.first_collision_step = np.full(self.num_envs, -1, dtype=np.int32)
+        self.consecutive_violation_steps = np.zeros(self.num_envs, dtype=np.int32)
         self._task_success_stats: dict[int, dict[str, int]] = {}
         self._eval_seen_trials: set[tuple[int, int]] = set()
 
@@ -831,6 +862,7 @@ class LiberoEnv(gym.Env):
             self.collision_once_contact[mask] = False
             self.collision_step_count[mask] = 0
             self.first_collision_step[mask] = -1
+            self.consecutive_violation_steps[mask] = 0
             self._elapsed_steps[env_idx] = 0
         else:
             self.prev_step_reward[:] = 0
@@ -845,6 +877,7 @@ class LiberoEnv(gym.Env):
             self.collision_once_contact[:] = False
             self.collision_step_count[:] = 0
             self.first_collision_step[:] = -1
+            self.consecutive_violation_steps[:] = 0
             self._elapsed_steps[:] = 0
 
     @staticmethod
@@ -985,6 +1018,7 @@ class LiberoEnv(gym.Env):
         self.success_once = self.success_once | safe_goal_terminations
         episode_info["success_once"] = self.success_once.copy()
         episode_info["raw_task_success_once"] = self.raw_task_success_once.copy()
+        episode_info["success"] = self.raw_task_success_once.copy()
         episode_info["first_raw_task_success_step"] = (
             self.first_raw_task_success_step.copy()
         )
@@ -999,6 +1033,7 @@ class LiberoEnv(gym.Env):
             episode_info["collision_step_count"] = self.collision_step_count.copy()
             episode_info["first_collision_step"] = self.first_collision_step.copy()
             episode_info["safety_violation_once"] = self.collision_once.copy()
+            episode_info["unsafe"] = self.collision_once.copy()
             episode_info["safe_success_once"] = self.success_once & ~self.collision_once
 
         # Use success episode_len for reward if already succeeded, else current elapsed
@@ -1202,17 +1237,32 @@ class LiberoEnv(gym.Env):
             if self.libero_type == "safety"
             else np.zeros(self.num_envs, dtype=bool)
         )
+        severe_collision_terminations, self.consecutive_violation_steps = (
+            detect_severe_collisions(
+                predicate_audits=predicate_audits,
+                constraint_violations=constraint_violations,
+                consecutive_violation_steps=self.consecutive_violation_steps,
+                hard_stop_predicates=self.severe_collision_predicates,
+                max_consecutive_violation_steps=(self.max_consecutive_violation_steps),
+            )
+        )
         # The LIBERO-Safety protocol counts success only when the goal is reached
         # without a constraint violation and terminates immediately on violation.
         safe_goal_terminations = raw_goal_terminations & ~constraint_violations
         official_terminations = safe_goal_terminations | constraint_violations
-        # Audit collection continues through violations and ends at raw task
-        # success or horizon. The official protocol remains unchanged when the
-        # auditor is disabled.
-        terminations = (
-            raw_goal_terminations.copy()
+        # official_eval emits the benchmark termination. shadow_collect records
+        # ordinary violations but only emits raw success or a severe hard stop.
+        # The official protocol remains unchanged when the auditor is disabled.
+        termination_mode = (
+            self.episode_auditor_mode
             if self.episode_auditor is not None
-            else official_terminations.copy()
+            else "official_eval"
+        )
+        terminations = select_emitted_terminations(
+            mode=termination_mode,
+            raw_task_terminations=raw_goal_terminations,
+            official_terminations=official_terminations,
+            severe_collision_terminations=severe_collision_terminations,
         )
         infos = list_of_dict_to_dict_of_list(info_lists)
         truncations = self.elapsed_steps >= self.cfg.max_episode_steps
@@ -1232,6 +1282,7 @@ class LiberoEnv(gym.Env):
             {
                 "raw_task": raw_goal_terminations,
                 "safety_violation": constraint_violations,
+                "severe_collision": severe_collision_terminations,
                 "official": official_terminations,
                 "emitted": terminations,
             }
@@ -1246,6 +1297,9 @@ class LiberoEnv(gym.Env):
                     reward=step_reward[env_id],
                     raw_task_termination=bool(raw_goal_terminations[env_id]),
                     safety_violation_termination=bool(constraint_violations[env_id]),
+                    severe_collision_termination=bool(
+                        severe_collision_terminations[env_id]
+                    ),
                     official_termination=bool(official_terminations[env_id]),
                     emitted_termination=bool(terminations[env_id]),
                     truncated=bool(truncations[env_id]),

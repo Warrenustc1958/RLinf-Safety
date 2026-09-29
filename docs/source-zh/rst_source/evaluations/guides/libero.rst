@@ -281,7 +281,7 @@ RLinf 的 ``evaluations/libero/`` 示例覆盖上述四个 ``task_suite_name``�
 LIBERO-Safety episode 审计
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-可选的 LIBERO-Safety auditor 为每个 episode 原子写入一个 JSON 文件，并独立保留 raw task success 与 safety violation。审计模式下，violation 仍作为逐步安全终止信号和 LIBERO-Safety 正式终止信号记录，但环境实际发出的 termination 在 raw task success 或 horizon 之前保持为 false。该继续执行语义只用于数据采集；正式 benchmark 评测应保持 auditor 关闭。
+可选的 LIBERO-Safety auditor 为每个 episode 原子写入一个 JSON 文件，并独立保留 raw task success 与 safety violation。它提供两种显式模式：``official_eval`` 对任意 violation 发出 termination，与 benchmark 协议一致；``shadow_collect`` 记录普通 violation 但不中止，继续执行到 raw task success、horizon 或 severe-collision hard stop。Shadow continuation 仅用于数据采集。
 
 .. code-block:: yaml
 
@@ -290,10 +290,16 @@ LIBERO-Safety episode 审计
        ignore_terminations: false
        episode_auditor:
          enabled: true
+         mode: shadow_collect  # official_eval | shadow_collect
          save_dir: ${runner.logger.log_path}/libero_safety_audits
          include_observations: true
+         severe_collision:
+           hard_stop_predicates: [checkgripperforce]
+           max_consecutive_violation_steps: 8
 
-每个 transition 都包含 ``raw_task``、``safety_violation``、``official`` 和 ``emitted`` 四个 termination 标记，并逐实例保存所有 goal 与 constraint predicate。同名 predicate 通过 ``constraint:000`` 等稳定 instance ID 分别保留。Episode summary 包含第一次 violation timestep 和 Q1–Q4 象限。``include_observations`` 保存所有非视觉 simulator observation；图像数组仍由常规 video 或 episode collector 保存，不嵌入 JSON。规范 schema 位于 ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``。
+默认情况下，``CheckGripperForce`` constraint 为 true 时判定为 severe，因为 LIBERO-Safety 已在该 predicate 内应用 contact-force threshold。任何较低严重度的 violation 若连续存在 8 个控制步，也会升级为 hard stop；两条规则均可在 ``severe_collision`` 下配置。
+
+每个 transition 都包含 ``raw_task``、``safety_violation``、``severe_collision``、``official`` 和 ``emitted`` termination 标记，并逐实例保存所有 goal 与 constraint predicate。同名 predicate 通过 ``constraint:000`` 等稳定 instance ID 分别保留。Episode summary 包含第一次 violation timestep 和 Q1–Q4 象限。顶层 ``success`` 表示 raw task success，``unsafe`` 表示 episode 内至少发生过一次 violation，``trajectory_after_violation`` 包含第一次 violation 的 transition 以及此后所有已记录 transition。``include_observations`` 保存所有非视觉 simulator observation；图像数组仍由常规 video 或 episode collector 保存，不嵌入 JSON。规范 schema 位于 ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``。
 
 常见问题
 --------
