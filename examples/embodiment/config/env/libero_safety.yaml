@@ -41,3 +41,13 @@ episode_auditor:
     hard_stop_predicates: [checkgripperforce]
     # Any persistent lower-severity violation is promoted to a hard stop.
     max_consecutive_violation_steps: 8
+  counterfactual_branch:
+    enabled: false
+    # Uniformly choose a pre-action state from this Q1 tail window.
+    risk_window_steps: 32
+    max_branches_per_root: 16
+    target_quadrants: [Q2, Q4]
+    # alpha blends the root action with a uniformly sampled action.
+    perturbation_range: [0.15, 1.0]
+    # Preserve the binary gripper command at index 6 by default.
+    action_dimensions: [0, 1, 2, 3, 4, 5]

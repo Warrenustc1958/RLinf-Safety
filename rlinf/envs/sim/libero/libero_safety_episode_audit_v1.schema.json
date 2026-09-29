@@ -11,6 +11,7 @@
     "outcome",
     "success",
     "unsafe",
+    "quadrant",
     "trajectory_after_violation"
   ],
   "properties": {
@@ -44,6 +45,19 @@
     "initial_observation": {},
     "success": {"type": "boolean"},
     "unsafe": {"type": "boolean"},
+    "quadrant": {"enum": ["Q1", "Q2", "Q3", "Q4"]},
+    "root_episode_id": {"type": "string"},
+    "branch_id": {"type": "string"},
+    "alpha": {"type": "number", "minimum": 0, "maximum": 1},
+    "perturbation_range": {
+      "type": "array",
+      "prefixItems": [
+        {"type": "number", "minimum": 0, "maximum": 1},
+        {"type": "number", "minimum": 0, "maximum": 1}
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
     "trajectory_after_violation": {
       "type": "array",
       "items": {"$ref": "#/$defs/transition"}

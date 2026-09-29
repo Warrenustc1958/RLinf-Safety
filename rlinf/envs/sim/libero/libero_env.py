@@ -25,6 +25,10 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.sim.libero.counterfactual_branch_collector import (
+    CounterfactualBranch,
+    CounterfactualBranchCollector,
+)
 from rlinf.envs.sim.libero.safety_auditor import (
     AUDIT_MODES,
     LiberoSafetyEpisodeAuditor,
@@ -285,6 +289,45 @@ class LiberoEnv(gym.Env):
                     auditor_cfg.get("include_observations", True)
                 ),
                 mode=self.episode_auditor_mode,
+            )
+        self.counterfactual_branch_collector = None
+        self._defer_counterfactual_restore = False
+        self._pending_counterfactual_restores = [None] * self.num_envs
+        branch_cfg = (
+            auditor_cfg.get("counterfactual_branch", {})
+            if auditor_cfg is not None
+            else {}
+        )
+        if bool(branch_cfg.get("enabled", False)):
+            if self.episode_auditor is None:
+                raise ValueError(
+                    "counterfactual_branch requires episode_auditor.enabled=true"
+                )
+            if self.episode_auditor_mode != "shadow_collect":
+                raise ValueError(
+                    "counterfactual_branch requires episode_auditor.mode=shadow_collect"
+                )
+            perturbation_range = tuple(
+                float(value)
+                for value in branch_cfg.get("perturbation_range", [0.15, 1.0])
+            )
+            if len(perturbation_range) != 2:
+                raise ValueError("perturbation_range must contain [min, max]")
+            self.counterfactual_branch_collector = CounterfactualBranchCollector(
+                num_envs=self.num_envs,
+                seed=int(branch_cfg.get("seed", self.seed)),
+                process_id=self.seed_offset,
+                risk_window_steps=int(branch_cfg.get("risk_window_steps", 32)),
+                max_branches_per_root=int(branch_cfg.get("max_branches_per_root", 16)),
+                perturbation_range=perturbation_range,
+                action_dimensions=tuple(
+                    int(index)
+                    for index in branch_cfg.get("action_dimensions", [0, 1, 2, 3, 4, 5])
+                ),
+                target_quadrants=frozenset(
+                    str(value).upper()
+                    for value in branch_cfg.get("target_quadrants", ["Q2", "Q4"])
+                ),
             )
 
     def _log_evaluation_mode(self):
@@ -1122,21 +1165,38 @@ class LiberoEnv(gym.Env):
 
     def _start_auditor_episodes(self, env_idx, reset_state_ids, raw_obs):
         """Initialize per-environment audit records after reset settling."""
-        if self.episode_auditor is None:
-            return
         for local_idx, env_id in enumerate(env_idx):
-            self.episode_auditor.start_episode(
-                int(env_id),
-                metadata={
-                    "task_suite": str(self.cfg.task_suite_name),
-                    "safety_level": f"L{self.safety_level}",
-                    "task_id": int(self.task_ids[env_id]),
-                    "trial_id": int(self.trial_ids[env_id]),
-                    "reset_state_id": int(reset_state_ids[local_idx]),
-                    "instruction": str(self.task_descriptions[env_id]),
-                },
-                initial_observation=raw_obs[local_idx],
-            )
+            env_id = int(env_id)
+            if self.counterfactual_branch_collector is not None:
+                self._pending_counterfactual_restores[env_id] = None
+                self.counterfactual_branch_collector.reset_root(env_id)
+            if self.episode_auditor is not None:
+                self.episode_auditor.start_episode(
+                    env_id,
+                    metadata=self._auditor_episode_metadata(
+                        env_id, int(reset_state_ids[local_idx])
+                    ),
+                    initial_observation=raw_obs[local_idx],
+                )
+
+    def _auditor_episode_metadata(
+        self,
+        env_id: int,
+        reset_state_id: int,
+        extra: dict | None = None,
+    ) -> dict:
+        """Build common metadata for root and counterfactual audit episodes."""
+        metadata = {
+            "task_suite": str(self.cfg.task_suite_name),
+            "safety_level": f"L{self.safety_level}",
+            "task_id": int(self.task_ids[env_id]),
+            "trial_id": int(self.trial_ids[env_id]),
+            "reset_state_id": int(reset_state_id),
+            "instruction": str(self.task_descriptions[env_id]),
+        }
+        if extra is not None:
+            metadata.update(extra)
+        return metadata
 
     def reset(
         self,
@@ -1219,10 +1279,132 @@ class LiberoEnv(gym.Env):
             depth=depth,
         )
 
+    def _prepare_counterfactual_actions(self, actions):
+        """Capture root snapshots and inject a branch's first perturbed action."""
+        collector = self.counterfactual_branch_collector
+        if collector is None:
+            return actions
+
+        prepared_actions = np.asarray(actions).copy()
+        for env_id in range(self.num_envs):
+            if self._pending_counterfactual_restores[env_id] is not None:
+                continue
+            perturbed_action = collector.consume_perturbed_action(env_id)
+            if perturbed_action is not None:
+                prepared_actions[env_id] = perturbed_action
+
+        root_env_ids = [
+            env_id
+            for env_id in range(self.num_envs)
+            if collector.is_collecting_root(env_id)
+        ]
+        if root_env_ids:
+            snapshots = self.env.snapshot_simulator_state(id=root_env_ids)
+            for env_id, snapshot in zip(root_env_ids, snapshots):
+                collector.record_root_step(
+                    env_id,
+                    timestep=int(self.elapsed_steps[env_id]) + 1,
+                    simulator_state=snapshot,
+                    action=prepared_actions[env_id],
+                )
+        return prepared_actions
+
+    def _start_counterfactual_branch(
+        self,
+        env_id: int,
+        branch: CounterfactualBranch,
+        raw_obs,
+    ) -> None:
+        """Restore one branch state and initialize its metrics and audit trail."""
+        restored = self.env.restore_simulator_state(
+            [branch.simulator_state], id=[env_id]
+        )[0]
+        raw_obs[env_id] = restored
+        self.current_raw_obs[env_id] = restored
+        self._reset_metrics(np.asarray([env_id]))
+        self.episode_auditor.start_episode(
+            env_id,
+            metadata=self._auditor_episode_metadata(
+                env_id,
+                int(self.reset_state_ids[env_id]),
+                extra={
+                    "episode_kind": "counterfactual_branch",
+                    **branch.metadata(),
+                },
+            ),
+            initial_observation=restored,
+        )
+
+    def _advance_counterfactual_branches(
+        self,
+        *,
+        raw_obs,
+        raw_goal_terminations,
+        terminations,
+        truncations,
+        active_episode_ids,
+    ) -> np.ndarray:
+        """Start or continue branch searches and return restored environments."""
+        collector = self.counterfactual_branch_collector
+        restored = np.zeros(self.num_envs, dtype=bool)
+        if collector is None:
+            return restored
+
+        for env_id in range(self.num_envs):
+            pending_branch = self._pending_counterfactual_restores[env_id]
+            if pending_branch is not None:
+                terminations[env_id] = False
+                truncations[env_id] = False
+                if not self._defer_counterfactual_restore:
+                    self._pending_counterfactual_restores[env_id] = None
+                    self._start_counterfactual_branch(env_id, pending_branch, raw_obs)
+                    restored[env_id] = True
+                continue
+
+            branch = None
+            if collector.is_collecting_root(env_id):
+                is_q1 = bool(raw_goal_terminations[env_id]) and not bool(
+                    self.collision_once[env_id]
+                )
+                if is_q1:
+                    root_episode_id = active_episode_ids[env_id]
+                    if root_episode_id is None:
+                        raise RuntimeError("Q1 root episode has no active auditor id")
+                    branch = collector.begin_search(
+                        env_id, root_episode_id=root_episode_id
+                    )
+            elif collector.is_running_branch(env_id) and bool(
+                terminations[env_id] or truncations[env_id]
+            ):
+                success = bool(self.raw_task_success_once[env_id])
+                unsafe = bool(self.collision_once[env_id])
+                quadrant = {
+                    (True, False): "Q1",
+                    (True, True): "Q2",
+                    (False, False): "Q3",
+                    (False, True): "Q4",
+                }[(success, unsafe)]
+                branch = collector.complete_branch(env_id, quadrant=quadrant)
+
+            if branch is None:
+                continue
+            if self._defer_counterfactual_restore:
+                self._pending_counterfactual_restores[env_id] = branch
+                terminations[env_id] = False
+                truncations[env_id] = False
+                continue
+            self._start_counterfactual_branch(env_id, branch, raw_obs)
+            terminations[env_id] = False
+            truncations[env_id] = False
+            restored[env_id] = True
+        return restored
+
     def step(self, actions=None, auto_reset=True, _skip_obs_wrap=False):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
+
+        actions = self._prepare_counterfactual_actions(actions)
 
         self._elapsed_steps += 1
         raw_obs, _reward, goal_terminations, info_lists = self.env.step(actions)
@@ -1287,8 +1469,12 @@ class LiberoEnv(gym.Env):
                 "emitted": terminations,
             }
         )
+        active_episode_ids = [None] * self.num_envs
         if self.episode_auditor is not None:
             for env_id in range(self.num_envs):
+                active_episode_ids[env_id] = self.episode_auditor.active_episode_id(
+                    env_id
+                )
                 self.episode_auditor.record_transition(
                     env_id,
                     timestep=int(self.elapsed_steps[env_id]),
@@ -1305,6 +1491,16 @@ class LiberoEnv(gym.Env):
                     truncated=bool(truncations[env_id]),
                     predicates=predicate_audits[env_id],
                 )
+        restored_branches = self._advance_counterfactual_branches(
+            raw_obs=raw_obs,
+            raw_goal_terminations=raw_goal_terminations,
+            terminations=terminations,
+            truncations=truncations,
+            active_episode_ids=active_episode_ids,
+        )
+        infos["terminations"]["emitted"] = to_tensor(terminations)
+        if restored_branches.any():
+            obs = None if _skip_obs_wrap else self._wrap_obs(raw_obs)
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(safe_goal_terminations)
             terminations[:] = False
@@ -1341,6 +1537,7 @@ class LiberoEnv(gym.Env):
         rendering_disabled = False
         try:
             for i in range(chunk_size):
+                self._defer_counterfactual_restore = i < chunk_size - 1
                 should_render = (not self.skip_intermediate_renders) or (
                     i == chunk_size - 1
                 )
@@ -1368,6 +1565,7 @@ class LiberoEnv(gym.Env):
                 raw_chunk_terminations.append(terminations)
                 raw_chunk_truncations.append(truncations)
         finally:
+            self._defer_counterfactual_restore = False
             if rendering_disabled:
                 self.env.set_camera_rendering(True)
 

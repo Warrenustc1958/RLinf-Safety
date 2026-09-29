@@ -301,6 +301,28 @@ LIBERO-Safety episode 审计
 
 每个 transition 都包含 ``raw_task``、``safety_violation``、``severe_collision``、``official`` 和 ``emitted`` termination 标记，并逐实例保存所有 goal 与 constraint predicate。同名 predicate 通过 ``constraint:000`` 等稳定 instance ID 分别保留。Episode summary 包含第一次 violation timestep 和 Q1–Q4 象限。顶层 ``success`` 表示 raw task success，``unsafe`` 表示 episode 内至少发生过一次 violation，``trajectory_after_violation`` 包含第一次 violation 的 transition 以及此后所有已记录 transition。``include_observations`` 保存所有非视觉 simulator observation；图像数组仍由常规 video 或 episode collector 保存，不嵌入 JSON。规范 schema 位于 ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``。
 
+Counterfactual branch 采集
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+可选的 counterfactual collector 只处理 Q1 根轨迹（raw success 且无 violation）。根 policy 执行期间，它在内存中保留一个有界的 action 前 MuJoCo state 尾部窗口。确认 Q1 后，collector 从该 risk-before 窗口均匀随机选择 timestep，恢复 simulator 和动态障碍物的 motion state，用 perturbed action 替换根轨迹的原动作，随后把控制权交还给同一个 policy。Collector 会持续尝试，直到同时找到 Q2、Q4，或达到 ``max_branches_per_root``。
+
+.. code-block:: yaml
+
+   episode_auditor:
+     enabled: true
+     mode: shadow_collect
+     counterfactual_branch:
+       enabled: true
+       risk_window_steps: 32
+       max_branches_per_root: 16
+       target_quadrants: [Q2, Q4]
+       perturbation_range: [0.15, 1.0]
+       action_dimensions: [0, 1, 2, 3, 4, 5]
+
+``alpha`` 从 ``perturbation_range`` 采样，用于混合根动作与均匀随机动作；默认保留 gripper 维度。每个 branch JSON 都把 ``root_episode_id``、``branch_id``、``alpha``、``perturbation_range`` 和 ``quadrant`` 提升为顶层字段；episode metadata 还保存所选根 timestep、原动作、扰动后动作与动作差值。非目标的 Q1/Q3 尝试也会保留，以便完整审计搜索过程。
+
+分支尝试占用正常 evaluation step budget。``max_steps_per_rollout_epoch`` 应覆盖根轨迹及所需分支；保守上界为 ``max_episode_steps * (1 + max_branches_per_root)``，并向上取整到 policy action chunk 大小的整数倍。
+
 常见问题
 --------
 

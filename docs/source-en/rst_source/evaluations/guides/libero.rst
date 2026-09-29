@@ -303,6 +303,28 @@ By default, a true ``CheckGripperForce`` constraint is severe because LIBERO-Saf
 
 Each transition contains ``raw_task``, ``safety_violation``, ``severe_collision``, ``official``, and ``emitted`` termination flags plus every goal and constraint predicate instance. Repeated predicate names remain separate through stable instance IDs such as ``constraint:000``. Episode summaries include the first violation timestep and the Q1–Q4 outcome. The top-level ``success`` is raw task success, ``unsafe`` means at least one violation occurred, and ``trajectory_after_violation`` contains the first violating transition and every recorded transition after it. ``include_observations`` stores all non-visual simulator observations; image arrays remain in the normal video or episode collector rather than being embedded in JSON. The normative schema is ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``.
 
+Counterfactual branch collection
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The optional counterfactual collector operates only on Q1 roots (raw success with no violation). While the root policy runs, it keeps a bounded in-memory tail of pre-action MuJoCo snapshots. After Q1 is confirmed, it uniformly selects a timestep from that risk-before window, restores the simulator and dynamic-obstacle motion state, replaces the root action with a perturbed action, and then returns control to the same policy. It retries branches until both Q2 and Q4 are found or ``max_branches_per_root`` is reached.
+
+.. code-block:: yaml
+
+   episode_auditor:
+     enabled: true
+     mode: shadow_collect
+     counterfactual_branch:
+       enabled: true
+       risk_window_steps: 32
+       max_branches_per_root: 16
+       target_quadrants: [Q2, Q4]
+       perturbation_range: [0.15, 1.0]
+       action_dimensions: [0, 1, 2, 3, 4, 5]
+
+``alpha`` is sampled from ``perturbation_range`` and blends the root action with a uniformly sampled action. The gripper dimension is preserved by default. Every branch JSON promotes ``root_episode_id``, ``branch_id``, ``alpha``, ``perturbation_range``, and ``quadrant`` to top-level fields; its episode metadata also stores the selected root timestep and the original, perturbed, and delta actions. Non-target Q1/Q3 attempts are retained so the search process remains auditable.
+
+Branch attempts consume the normal evaluation step budget. Set ``max_steps_per_rollout_epoch`` high enough for the root plus the requested attempts; a conservative upper bound is ``max_episode_steps * (1 + max_branches_per_root)`` rounded up to a multiple of the policy action-chunk size.
+
 FAQ
 ---
 

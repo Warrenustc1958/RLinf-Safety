@@ -224,6 +224,14 @@ class LiberoSafetyEpisodeAuditor:
             )
         self._episodes[env_idx] = episode
 
+    def active_episode_id(self, env_idx: int) -> str | None:
+        """Return the active episode id for an environment, if one exists."""
+        self._check_env_idx(env_idx)
+        episode = self._episodes[env_idx]
+        if episode is None:
+            return None
+        return str(episode["episode"]["episode_id"])
+
     def record_transition(
         self,
         env_idx: int,
@@ -350,11 +358,20 @@ class LiberoSafetyEpisodeAuditor:
         )
         episode["success"] = raw_success
         episode["unsafe"] = safety_violation
+        episode["quadrant"] = quadrant
         episode["trajectory_after_violation"] = (
             trajectory[first_violation_index:]
             if first_violation_index is not None
             else []
         )
+        for key in (
+            "root_episode_id",
+            "branch_id",
+            "alpha",
+            "perturbation_range",
+        ):
+            if key in episode["episode"]:
+                episode[key] = episode["episode"][key]
 
         episode_id = episode["episode"]["episode_id"]
         output_path = self._output_dir / f"{episode_id}.json"

@@ -270,6 +270,53 @@ def test_official_violation_and_shadow_severe_collision_hard_stop(tmp_path: Path
     assert severe_record["outcome"]["severe_collision"] is True
 
 
+def test_branch_metadata_is_promoted_to_top_level_output(tmp_path: Path):
+    auditor = LiberoSafetyEpisodeAuditor(
+        tmp_path,
+        process_id=0,
+        num_envs=1,
+        mode="shadow_collect",
+    )
+    auditor.start_episode(
+        0,
+        metadata={
+            "task_suite": "human_safety",
+            "safety_level": "L1",
+            "task_id": 1,
+            "trial_id": 2,
+            "reset_state_id": 3,
+            "instruction": "handover safely",
+            "root_episode_id": "root-001",
+            "branch_id": "root-001-branch-000",
+            "alpha": 0.4,
+            "perturbation_range": [0.2, 0.8],
+        },
+        initial_observation={},
+    )
+    output_path = auditor.record_transition(
+        0,
+        timestep=1,
+        action=[0.0] * 7,
+        observation={},
+        reward=0.0,
+        raw_task_termination=False,
+        safety_violation_termination=True,
+        severe_collision_termination=True,
+        official_termination=True,
+        emitted_termination=True,
+        truncated=False,
+        predicates=[_predicate("constraint:000", True)],
+    )
+
+    assert output_path is not None
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert record["root_episode_id"] == "root-001"
+    assert record["branch_id"] == "root-001-branch-000"
+    assert record["alpha"] == 0.4
+    assert record["perturbation_range"] == [0.2, 0.8]
+    assert record["quadrant"] == "Q4"
+
+
 def test_auditor_writes_safe_failure_at_horizon(tmp_path: Path):
     auditor = LiberoSafetyEpisodeAuditor(
         tmp_path,

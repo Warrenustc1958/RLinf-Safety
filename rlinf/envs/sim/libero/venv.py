@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import multiprocessing
 import os
 import warnings
@@ -133,6 +134,53 @@ def _set_camera_rendering(env, enabled: bool) -> None:
             observables[name]._enabled = enabled
 
 
+def _unwrap_task_env(env):
+    """Return the innermost LIBERO task environment."""
+    task_env = env
+    seen = set()
+    while hasattr(task_env, "env") and id(task_env) not in seen:
+        seen.add(id(task_env))
+        nested = task_env.env
+        if nested is task_env:
+            break
+        task_env = nested
+    return task_env
+
+
+def _snapshot_simulator_state(env) -> dict[str, Any]:
+    """Capture MuJoCo and LIBERO dynamic-obstacle state for branching."""
+    task_env = _unwrap_task_env(env)
+    sim = task_env.sim
+    generators = getattr(task_env, "mocap_motion_generators", {})
+    return {
+        "mujoco_state": sim.get_state().flatten().copy(),
+        "mocap_pos": sim.data.mocap_pos.copy(),
+        "mocap_quat": sim.data.mocap_quat.copy(),
+        "motion_generators": {
+            name: copy.deepcopy(generator.__dict__)
+            for name, generator in generators.items()
+        },
+    }
+
+
+def _restore_simulator_state(env, snapshot: dict[str, Any]):
+    """Restore a branching snapshot and regenerate the corresponding observation."""
+    task_env = _unwrap_task_env(env)
+    sim = task_env.sim
+    sim.set_state_from_flattened(snapshot["mujoco_state"])
+    sim.data.mocap_pos[:] = snapshot["mocap_pos"]
+    sim.data.mocap_quat[:] = snapshot["mocap_quat"]
+    generators = getattr(task_env, "mocap_motion_generators", {})
+    for name, generator_state in snapshot.get("motion_generators", {}).items():
+        if name in generators:
+            generators[name].__dict__.clear()
+            generators[name].__dict__.update(copy.deepcopy(generator_state))
+    sim.forward()
+    task_env._post_process()
+    task_env._update_observables(force=True)
+    return task_env._get_observations()
+
+
 def _worker(
     parent: connection.Connection,
     p: connection.Connection,
@@ -221,6 +269,10 @@ def _worker(
                 p.send(env.get_segmentation_of_interest(data))
             elif cmd == "get_sim_state":
                 p.send(env.get_sim_state())
+            elif cmd == "snapshot_simulator_state":
+                p.send(_snapshot_simulator_state(env))
+            elif cmd == "restore_simulator_state":
+                p.send(_restore_simulator_state(env, data))
             elif cmd == "set_init_state":
                 obs = env.set_init_state(data)
                 p.send(obs)
@@ -340,3 +392,27 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
             self.workers[i].parent_remote.send(["set_camera_rendering", enabled])
         for i in id:
             self.workers[i].parent_remote.recv()
+
+    def snapshot_simulator_state(self, id=None):
+        """Return counterfactual snapshots for selected subprocesses."""
+        self._assert_is_not_closed()
+        id = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(id)
+        for i in id:
+            self.workers[i].parent_remote.send(["snapshot_simulator_state", None])
+        return [self.workers[i].parent_remote.recv() for i in id]
+
+    def restore_simulator_state(self, snapshots, id=None):
+        """Restore snapshots and return regenerated observations."""
+        self._assert_is_not_closed()
+        id = self._wrap_id(id)
+        if len(snapshots) != len(id):
+            raise ValueError("one simulator snapshot is required per environment id")
+        if self.is_async:
+            self._assert_id(id)
+        for snapshot, env_id in zip(snapshots, id):
+            self.workers[env_id].parent_remote.send(
+                ["restore_simulator_state", snapshot]
+            )
+        return np.stack([self.workers[i].parent_remote.recv() for i in id])
