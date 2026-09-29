@@ -184,13 +184,18 @@ def get_benchmark_overridden(benchmark_name) -> Benchmark:
 def build_interleaved_eval_reset_state_ids(
     trial_id_bins: list[int],
     cumsum_trial_id_bins: np.ndarray,
+    task_ids: list[int] | None = None,
 ) -> np.ndarray:
-    """Order (task0, trial0), (task1, trial0), ... for even parallel coverage."""
+    """Interleave trials across all tasks, or across a selected task subset."""
     interleaved = []
-    num_tasks = len(trial_id_bins)
-    max_trials = max(trial_id_bins) if trial_id_bins else 0
+    selected_task_ids = (
+        list(range(len(trial_id_bins))) if task_ids is None else list(task_ids)
+    )
+    max_trials = (
+        max((trial_id_bins[task_id] for task_id in selected_task_ids), default=0)
+    )
     for trial in range(max_trials):
-        for task_id in range(num_tasks):
+        for task_id in selected_task_ids:
             if trial < trial_id_bins[task_id]:
                 start = cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
                 interleaved.append(start + trial)

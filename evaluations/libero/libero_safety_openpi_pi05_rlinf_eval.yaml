@@ -36,7 +36,9 @@ env:
   eval:
     rollout_epoch: 1
     total_num_envs: 1
-    auto_reset: True
+    # One fixed initial state per environment. This keeps a 50-environment
+    # suite-level run equal to 5 tasks x 10 trials.
+    auto_reset: False
     ignore_terminations: False
     max_episode_steps: 512
     # Must be divisible by rollout.model.num_action_chunks (5).

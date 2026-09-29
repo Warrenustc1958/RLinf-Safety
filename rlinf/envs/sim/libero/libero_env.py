@@ -603,12 +603,16 @@ class LiberoEnv(gym.Env):
 
     def get_reset_state_ids_all(self):
         if self.is_eval:
-            if self._valid_reset_state_ids is not None:
-                reset_state_ids = self._valid_reset_state_ids.copy()
-            else:
-                reset_state_ids = build_interleaved_eval_reset_state_ids(
-                    self.trial_id_bins, self.cumsum_trial_id_bins
-                )
+            # Interleave before truncating to total_num_envs.  LIBERO-Safety
+            # selects the five tasks for one level via task_id_filter; keeping
+            # their state IDs task-contiguous would make a 50-episode run
+            # evaluate only the first task's 50 initial states instead of ten
+            # trials from each of the five tasks.
+            reset_state_ids = build_interleaved_eval_reset_state_ids(
+                self.trial_id_bins,
+                self.cumsum_trial_id_bins,
+                task_ids=self.task_id_filter,
+            )
             return distribute_reset_state_ids_round_robin(
                 reset_state_ids, self.total_num_processes
             )
