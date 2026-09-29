@@ -36,6 +36,12 @@ episode_auditor:
   mode: official_eval  # official_eval | shadow_collect
   save_dir: ${runner.logger.log_path}/libero_safety_audits
   include_observations: true
+  # Required by the unified Wan/SAM dataset builder. Frames are written to an
+  # episode-id-aligned NPZ sidecar, never embedded in the audit JSON.
+  save_visual_observations: false
+  # Main view matches the current Wan backend. Add robot0_eye_in_hand_image only
+  # when a future multi-view model will consume it (roughly doubles image I/O).
+  visual_camera_keys: [agentview_image]
   severe_collision:
     # CheckGripperForce already applies LIBERO-Safety's force threshold.
     hard_stop_predicates: [checkgripperforce]

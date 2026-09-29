@@ -172,6 +172,8 @@ class LiberoSafetyEpisodeAuditor:
         num_envs: int,
         include_observations: bool = True,
         mode: str = "official_eval",
+        save_visual_observations: bool = False,
+        visual_camera_keys: tuple[str, ...] = ("agentview_image",),
     ) -> None:
         if mode not in AUDIT_MODES:
             raise ValueError(
@@ -182,12 +184,24 @@ class LiberoSafetyEpisodeAuditor:
         self.num_envs = int(num_envs)
         self.include_observations = bool(include_observations)
         self.mode = mode
+        self.save_visual_observations = bool(save_visual_observations)
+        self.visual_camera_keys = tuple(str(key) for key in visual_camera_keys)
+        if self.save_visual_observations and not self.visual_camera_keys:
+            raise ValueError(
+                "visual_camera_keys must not be empty when visual saving is enabled"
+            )
         self._output_dir = self.save_dir / f"process_{self.process_id:04d}"
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._visual_output_dir = self._output_dir / "visual"
+        if self.save_visual_observations:
+            self._visual_output_dir.mkdir(parents=True, exist_ok=True)
         self._episode_indices = [
             self._next_episode_index(env_idx) for env_idx in range(self.num_envs)
         ]
         self._episodes: list[dict[str, Any] | None] = [None] * self.num_envs
+        self._visual_frames: list[dict[str, list[np.ndarray]] | None] = [
+            None
+        ] * self.num_envs
 
     def start_episode(
         self,
@@ -223,6 +237,11 @@ class LiberoSafetyEpisodeAuditor:
                 initial_observation
             )
         self._episodes[env_idx] = episode
+        if self.save_visual_observations:
+            initial_frames = self._extract_visual_frames(initial_observation)
+            self._visual_frames[env_idx] = {
+                key: [frame] for key, frame in initial_frames.items()
+            }
 
     def active_episode_id(self, env_idx: int) -> str | None:
         """Return the active episode id for an environment, if one exists."""
@@ -271,6 +290,13 @@ class LiberoSafetyEpisodeAuditor:
         if self.include_observations:
             transition["observation"] = _non_visual_observation(observation)
         episode["trajectory"].append(transition)
+        if self.save_visual_observations:
+            visual_frames = self._visual_frames[env_idx]
+            if visual_frames is None:
+                raise RuntimeError(f"Missing visual buffer for env_idx={env_idx}")
+            current_frames = self._extract_visual_frames(observation)
+            for key, frame in current_frames.items():
+                visual_frames[key].append(frame)
 
         if severe_collision_termination:
             return self._finalize(env_idx, end_reason="severe_collision")
@@ -299,6 +325,7 @@ class LiberoSafetyEpisodeAuditor:
         trajectory = episode["trajectory"]
         if not trajectory:
             self._episodes[env_idx] = None
+            self._visual_frames[env_idx] = None
             return None
 
         first_raw_success = next(
@@ -374,6 +401,40 @@ class LiberoSafetyEpisodeAuditor:
                 episode[key] = episode["episode"][key]
 
         episode_id = episode["episode"]["episode_id"]
+        if self.save_visual_observations:
+            visual_frames = self._visual_frames[env_idx]
+            if visual_frames is None:
+                raise RuntimeError(f"Missing visual buffer for episode {episode_id}")
+            expected_frames = len(trajectory) + 1
+            invalid_lengths = {
+                key: len(frames)
+                for key, frames in visual_frames.items()
+                if len(frames) != expected_frames
+            }
+            if invalid_lengths:
+                raise RuntimeError(
+                    f"Visual/action alignment failed for {episode_id}: expected "
+                    f"{expected_frames} frames, got {invalid_lengths}"
+                )
+            visual_path = self._visual_output_dir / f"{episode_id}.npz"
+            temporary_visual_path = visual_path.with_suffix(".npz.tmp")
+            with temporary_visual_path.open("wb") as file:
+                np.savez_compressed(
+                    file,
+                    **{
+                        key: np.stack(frames, axis=0)
+                        for key, frames in visual_frames.items()
+                    },
+                )
+            os.replace(temporary_visual_path, visual_path)
+            episode["visual_trajectory"] = {
+                "format": "npz",
+                "path": f"visual/{visual_path.name}",
+                "camera_keys": list(visual_frames),
+                "num_frames": expected_frames,
+                "preprocessing": "rotate_180_to_rlinf_policy_view",
+                "alignment": "frame[t] + action[t] -> frame[t+1]",
+            }
         output_path = self._output_dir / f"{episode_id}.json"
         temporary_path = output_path.with_suffix(".json.tmp")
         with temporary_path.open("w", encoding="utf-8") as file:
@@ -381,8 +442,31 @@ class LiberoSafetyEpisodeAuditor:
         os.replace(temporary_path, output_path)
 
         self._episodes[env_idx] = None
+        self._visual_frames[env_idx] = None
         self._episode_indices[env_idx] += 1
         return output_path
+
+    def _extract_visual_frames(self, observation: Any) -> dict[str, np.ndarray]:
+        """Extract policy-view RGB frames and fail fast on incomplete data."""
+        if not isinstance(observation, dict):
+            raise RuntimeError(
+                "Visual episode collection requires dictionary observations"
+            )
+        frames: dict[str, np.ndarray] = {}
+        for key in self.visual_camera_keys:
+            if key not in observation:
+                raise RuntimeError(
+                    f"Visual camera {key!r} is missing from observation; "
+                    f"available keys: {sorted(observation)}"
+                )
+            frame = np.asarray(observation[key])
+            if frame.ndim != 3 or frame.shape[-1] not in (3, 4):
+                raise RuntimeError(
+                    f"Visual camera {key!r} must be HWC RGB(A), got {frame.shape}"
+                )
+            # LIBERO camera buffers are upside-down relative to the policy input.
+            frames[key] = np.ascontiguousarray(frame[::-1, ::-1, :3]).copy()
+        return frames
 
     def _next_episode_index(self, env_idx: int) -> int:
         prefix = f"process-{self.process_id:04d}-env-{env_idx:03d}-episode-"

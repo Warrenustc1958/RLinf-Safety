@@ -295,13 +295,15 @@ The optional LIBERO-Safety auditor writes one atomic JSON file per episode while
          mode: shadow_collect  # official_eval | shadow_collect
          save_dir: ${runner.logger.log_path}/libero_safety_audits
          include_observations: true
+         save_visual_observations: true
+         visual_camera_keys: [agentview_image]
          severe_collision:
            hard_stop_predicates: [checkgripperforce]
            max_consecutive_violation_steps: 8
 
 By default, a true ``CheckGripperForce`` constraint is severe because LIBERO-Safety already applies its contact-force threshold. Any lower-severity violation that persists for eight consecutive control steps is also promoted to a hard stop. Both rules are configurable under ``severe_collision``.
 
-Each transition contains ``raw_task``, ``safety_violation``, ``severe_collision``, ``official``, and ``emitted`` termination flags plus every goal and constraint predicate instance. Repeated predicate names remain separate through stable instance IDs such as ``constraint:000``. Episode summaries include the first violation timestep and the Q1–Q4 outcome. The top-level ``success`` is raw task success, ``unsafe`` means at least one violation occurred, and ``trajectory_after_violation`` contains the first violating transition and every recorded transition after it. ``include_observations`` stores all non-visual simulator observations; image arrays remain in the normal video or episode collector rather than being embedded in JSON. The normative schema is ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``.
+Each transition contains ``raw_task``, ``safety_violation``, ``severe_collision``, ``official``, and ``emitted`` termination flags plus every goal and constraint predicate instance. Repeated predicate names remain separate through stable instance IDs such as ``constraint:000``. Episode summaries include the first violation timestep and the Q1–Q4 outcome. The top-level ``success`` is raw task success, ``unsafe`` means at least one violation occurred, and ``trajectory_after_violation`` contains the first violating transition and every recorded transition after it. ``include_observations`` stores all non-visual simulator observations. When ``save_visual_observations`` is enabled, policy-oriented RGB frames are written to an episode-ID-aligned compressed NPZ sidecar instead of being embedded in JSON. The normative schema is ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``.
 
 Counterfactual branch collection
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -324,6 +326,25 @@ The optional counterfactual collector operates only on Q1 roots (raw success wit
 ``alpha`` is sampled from ``perturbation_range`` and blends the root action with a uniformly sampled action. The gripper dimension is preserved by default. Every branch JSON promotes ``root_episode_id``, ``branch_id``, ``alpha``, ``perturbation_range``, and ``quadrant`` to top-level fields; its episode metadata also stores the selected root timestep and the original, perturbed, and delta actions. Non-target Q1/Q3 attempts are retained so the search process remains auditable.
 
 Branch attempts consume the normal evaluation step budget. Set ``max_steps_per_rollout_epoch`` high enough for the root plus the requested attempts; a conservative upper bound is ``max_episode_steps * (1 + max_branches_per_root)`` rounded up to a multiple of the policy action-chunk size.
+
+Unified Wan/SAM dataset builder
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The dataset builder validates every JSON/NPZ pair before writing anything. It exports the existing RLinf Wan ``.npy`` trajectory format under ``wan/{train,val,test}``, an episode-level ``manifest.jsonl``, and action-aligned SAM labels under ``sam/{train,val,test}.jsonl``. Every SAM row retains all predicate-instance values, the active constraint instances, instantaneous and cumulative unsafe labels, severity, time to the next violation, and multi-horizon risk targets. Counterfactual branches are assigned to the same split as their root episode.
+
+.. code-block:: bash
+
+   python -m toolkits.libero_safety.build_dataset \
+     --audit-root /path/to/root_rollouts/libero_safety_audits \
+     --audit-root /path/to/branch_rollouts/libero_safety_audits \
+     --output-dir /path/to/wan_sam_dataset \
+     --quadrants Q1 Q2 Q3 Q4 \
+     --min-per-quadrant Q1=375 --min-per-quadrant Q2=375 \
+     --min-per-quadrant Q3=375 --min-per-quadrant Q4=375 \
+     --max-per-quadrant Q1=375 --max-per-quadrant Q2=375 \
+     --max-per-quadrant Q3=375 --max-per-quadrant Q4=375
+
+Use ``--dry-run`` first to validate readiness and report counts without creating a dataset. The default split unit is ``root``: an episode and all its counterfactual descendants remain together. Use ``--split-unit task`` for task-held-out validation. The output directory must be new or empty, so a previous dataset cannot be silently mixed with a later collection.
 
 FAQ
 ---

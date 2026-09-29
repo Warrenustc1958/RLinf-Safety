@@ -289,6 +289,15 @@ class LiberoEnv(gym.Env):
                     auditor_cfg.get("include_observations", True)
                 ),
                 mode=self.episode_auditor_mode,
+                save_visual_observations=bool(
+                    auditor_cfg.get("save_visual_observations", False)
+                ),
+                visual_camera_keys=tuple(
+                    str(key)
+                    for key in auditor_cfg.get(
+                        "visual_camera_keys", ["agentview_image"]
+                    )
+                ),
             )
         self.counterfactual_branch_collector = None
         self._defer_counterfactual_restore = False

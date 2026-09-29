@@ -293,13 +293,15 @@ LIBERO-Safety episode 审计
          mode: shadow_collect  # official_eval | shadow_collect
          save_dir: ${runner.logger.log_path}/libero_safety_audits
          include_observations: true
+         save_visual_observations: true
+         visual_camera_keys: [agentview_image]
          severe_collision:
            hard_stop_predicates: [checkgripperforce]
            max_consecutive_violation_steps: 8
 
 默认情况下，``CheckGripperForce`` constraint 为 true 时判定为 severe，因为 LIBERO-Safety 已在该 predicate 内应用 contact-force threshold。任何较低严重度的 violation 若连续存在 8 个控制步，也会升级为 hard stop；两条规则均可在 ``severe_collision`` 下配置。
 
-每个 transition 都包含 ``raw_task``、``safety_violation``、``severe_collision``、``official`` 和 ``emitted`` termination 标记，并逐实例保存所有 goal 与 constraint predicate。同名 predicate 通过 ``constraint:000`` 等稳定 instance ID 分别保留。Episode summary 包含第一次 violation timestep 和 Q1–Q4 象限。顶层 ``success`` 表示 raw task success，``unsafe`` 表示 episode 内至少发生过一次 violation，``trajectory_after_violation`` 包含第一次 violation 的 transition 以及此后所有已记录 transition。``include_observations`` 保存所有非视觉 simulator observation；图像数组仍由常规 video 或 episode collector 保存，不嵌入 JSON。规范 schema 位于 ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``。
+每个 transition 都包含 ``raw_task``、``safety_violation``、``severe_collision``、``official`` 和 ``emitted`` termination 标记，并逐实例保存所有 goal 与 constraint predicate。同名 predicate 通过 ``constraint:000`` 等稳定 instance ID 分别保留。Episode summary 包含第一次 violation timestep 和 Q1–Q4 象限。顶层 ``success`` 表示 raw task success，``unsafe`` 表示 episode 内至少发生过一次 violation，``trajectory_after_violation`` 包含第一次 violation 的 transition 以及此后所有已记录 transition。``include_observations`` 保存所有非视觉 simulator observation。启用 ``save_visual_observations`` 后，auditor 会将与 policy 方向一致的 RGB 帧写入按 episode ID 对齐的压缩 NPZ sidecar，不会把图像嵌入 JSON。规范 schema 位于 ``rlinf/envs/sim/libero/libero_safety_episode_audit_v1.schema.json``。
 
 Counterfactual branch 采集
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -322,6 +324,25 @@ Counterfactual branch 采集
 ``alpha`` 从 ``perturbation_range`` 采样，用于混合根动作与均匀随机动作；默认保留 gripper 维度。每个 branch JSON 都把 ``root_episode_id``、``branch_id``、``alpha``、``perturbation_range`` 和 ``quadrant`` 提升为顶层字段；episode metadata 还保存所选根 timestep、原动作、扰动后动作与动作差值。非目标的 Q1/Q3 尝试也会保留，以便完整审计搜索过程。
 
 分支尝试占用正常 evaluation step budget。``max_steps_per_rollout_epoch`` 应覆盖根轨迹及所需分支；保守上界为 ``max_episode_steps * (1 + max_branches_per_root)``，并向上取整到 policy action chunk 大小的整数倍。
+
+统一 Wan/SAM dataset builder
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Dataset builder 会在写任何输出前严格校验每个 JSON/NPZ 对。它在 ``wan/{train,val,test}`` 下生成 RLinf 现有 Wan reader 可直接读取的 ``.npy`` 轨迹，同时生成 episode 级 ``manifest.jsonl``，以及 ``sam/{train,val,test}.jsonl`` 下与 action 对齐的 SAM 标签。每个 SAM step 都保留所有 predicate-instance 的值、当前激活的 constraint instance、瞬时与累计 unsafe、severity、到下一次 violation 的步数和多时间窗风险标签。Counterfactual branch 与其 root episode 必定进入同一 split。
+
+.. code-block:: bash
+
+   python -m toolkits.libero_safety.build_dataset \
+     --audit-root /path/to/root_rollouts/libero_safety_audits \
+     --audit-root /path/to/branch_rollouts/libero_safety_audits \
+     --output-dir /path/to/wan_sam_dataset \
+     --quadrants Q1 Q2 Q3 Q4 \
+     --min-per-quadrant Q1=375 --min-per-quadrant Q2=375 \
+     --min-per-quadrant Q3=375 --min-per-quadrant Q4=375 \
+     --max-per-quadrant Q1=375 --max-per-quadrant Q2=375 \
+     --max-per-quadrant Q3=375 --max-per-quadrant Q4=375
+
+建议先加 ``--dry-run``，只检查数据是否可用并统计各象限数量，不创建 dataset。默认 ``--split-unit root``，保证 root 及其全部反事实后代不跨 split；若要按任务留出验证集，使用 ``--split-unit task``。输出目录必须不存在或为空，避免新旧采集批次被静默混合。
 
 常见问题
 --------

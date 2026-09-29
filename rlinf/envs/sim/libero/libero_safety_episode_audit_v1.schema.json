@@ -43,6 +43,34 @@
       }
     },
     "initial_observation": {},
+    "visual_trajectory": {
+      "type": "object",
+      "required": [
+        "format",
+        "path",
+        "camera_keys",
+        "num_frames",
+        "preprocessing",
+        "alignment"
+      ],
+      "properties": {
+        "format": {"const": "npz"},
+        "path": {"type": "string"},
+        "camera_keys": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"}
+        },
+        "num_frames": {"type": "integer", "minimum": 2},
+        "preprocessing": {
+          "const": "rotate_180_to_rlinf_policy_view"
+        },
+        "alignment": {
+          "const": "frame[t] + action[t] -> frame[t+1]"
+        }
+      },
+      "additionalProperties": false
+    },
     "success": {"type": "boolean"},
     "unsafe": {"type": "boolean"},
     "quadrant": {"enum": ["Q1", "Q2", "Q3", "Q4"]},
