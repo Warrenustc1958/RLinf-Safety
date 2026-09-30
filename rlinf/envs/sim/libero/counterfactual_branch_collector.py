@@ -132,6 +132,22 @@ class CounterfactualBranchCollector:
         self._active_branches[env_idx] = None
         self._pending_perturbed_actions[env_idx] = None
 
+    def set_root_episode_id(self, env_idx: int, episode_id: str) -> None:
+        """Bind the audit record created at root reset to this search."""
+        self._check_env_idx(env_idx)
+        if not self.is_collecting_root(env_idx):
+            raise RuntimeError(
+                f"cannot set a root episode id while env {env_idx} is not in root phase"
+            )
+        if not episode_id:
+            raise ValueError("root episode id must be non-empty")
+        self._root_episode_ids[env_idx] = str(episode_id)
+
+    def root_episode_id(self, env_idx: int) -> str | None:
+        """Return the audit id bound when the current root episode began."""
+        self._check_env_idx(env_idx)
+        return self._root_episode_ids[env_idx]
+
     def is_collecting_root(self, env_idx: int) -> bool:
         """Return whether the environment is recording a root trajectory."""
         self._check_env_idx(env_idx)
@@ -163,14 +179,19 @@ class CounterfactualBranchCollector:
         )
 
     def begin_search(
-        self, env_idx: int, *, root_episode_id: str
+        self, env_idx: int, *, root_episode_id: str | None = None
     ) -> CounterfactualBranch | None:
         """Begin branching after the recorded root is confirmed as Q1."""
         self._check_env_idx(env_idx)
         if not self._histories[env_idx]:
             self._phases[env_idx] = "finished"
             return None
-        self._root_episode_ids[env_idx] = str(root_episode_id)
+        if root_episode_id is not None:
+            if self._root_episode_ids[env_idx] not in (None, str(root_episode_id)):
+                raise RuntimeError("root episode id changed during counterfactual search")
+            self._root_episode_ids[env_idx] = str(root_episode_id)
+        if self._root_episode_ids[env_idx] is None:
+            raise RuntimeError("root episode id was not bound at root reset")
         self._phases[env_idx] = "branch"
         self._branch_counts[env_idx] = 0
         self._found_quadrants[env_idx].clear()

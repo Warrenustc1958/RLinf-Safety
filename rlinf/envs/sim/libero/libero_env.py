@@ -86,6 +86,22 @@ def _read_bddl_language_and_goal(bddl_path: str):
     return language, goal
 
 
+def _requires_libero_shadow_continuation(cfg) -> bool:
+    """Whether the simulator must not latch its own horizon termination.
+
+    In LIBERO-Safety, BDDL replaces the *returned* ``done`` with raw task
+    success, but robosuite still latches ``env.done`` at its internal horizon.
+    A shadow rollout deliberately continues after ordinary violations and can
+    also span an action chunk after an emitted termination.  Let RLinf own the
+    episode boundary in that mode, otherwise the next simulator action raises
+    ``ValueError: executing action in terminated episode``.
+    """
+    auditor_cfg = OmegaConf.select(cfg, "episode_auditor", default=None)
+    return bool(auditor_cfg is not None and auditor_cfg.get("enabled", False)) and (
+        str(auditor_cfg.get("mode", "official_eval")).lower() == "shadow_collect"
+    )
+
+
 libero_type = get_libero_type()
 
 if libero_type in ["pro", "plus"]:
@@ -423,6 +439,13 @@ class LiberoEnv(gym.Env):
     def get_env_fn_params(self, env_idx=None):
         env_fn_params = []
         base_env_args = OmegaConf.to_container(self.cfg.init_params, resolve=True)
+        if self.libero_type == "safety" and _requires_libero_shadow_continuation(
+            self.cfg
+        ):
+            # ``max_episode_steps`` in LiberoEnv remains the authoritative
+            # horizon.  This only prevents robosuite from rejecting a later
+            # action inside the same shadow trajectory.
+            base_env_args["ignore_done"] = True
 
         variant = os.environ.get(
             "LIBERO_TYPE",
@@ -1187,6 +1210,15 @@ class LiberoEnv(gym.Env):
                     ),
                     initial_observation=raw_obs[local_idx],
                 )
+                if self.counterfactual_branch_collector is not None:
+                    episode_id = self.episode_auditor.active_episode_id(env_id)
+                    if episode_id is None:
+                        raise RuntimeError(
+                            f"failed to start root audit episode for env {env_id}"
+                        )
+                    self.counterfactual_branch_collector.set_root_episode_id(
+                        env_id, episode_id
+                    )
 
     def _auditor_episode_metadata(
         self,
@@ -1351,7 +1383,6 @@ class LiberoEnv(gym.Env):
         raw_goal_terminations,
         terminations,
         truncations,
-        active_episode_ids,
     ) -> np.ndarray:
         """Start or continue branch searches and return restored environments."""
         collector = self.counterfactual_branch_collector
@@ -1376,12 +1407,10 @@ class LiberoEnv(gym.Env):
                     self.collision_once[env_id]
                 )
                 if is_q1:
-                    root_episode_id = active_episode_ids[env_id]
+                    root_episode_id = collector.root_episode_id(env_id)
                     if root_episode_id is None:
-                        raise RuntimeError("Q1 root episode has no active auditor id")
-                    branch = collector.begin_search(
-                        env_id, root_episode_id=root_episode_id
-                    )
+                        raise RuntimeError("Q1 root episode has no bound auditor id")
+                    branch = collector.begin_search(env_id)
             elif collector.is_running_branch(env_id) and bool(
                 terminations[env_id] or truncations[env_id]
             ):
@@ -1478,12 +1507,8 @@ class LiberoEnv(gym.Env):
                 "emitted": terminations,
             }
         )
-        active_episode_ids = [None] * self.num_envs
         if self.episode_auditor is not None:
             for env_id in range(self.num_envs):
-                active_episode_ids[env_id] = self.episode_auditor.active_episode_id(
-                    env_id
-                )
                 self.episode_auditor.record_transition(
                     env_id,
                     timestep=int(self.elapsed_steps[env_id]),
@@ -1505,7 +1530,6 @@ class LiberoEnv(gym.Env):
             raw_goal_terminations=raw_goal_terminations,
             terminations=terminations,
             truncations=truncations,
-            active_episode_ids=active_episode_ids,
         )
         infos["terminations"]["emitted"] = to_tensor(terminations)
         if restored_branches.any():

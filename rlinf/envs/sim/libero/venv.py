@@ -178,6 +178,15 @@ def _restore_simulator_state(env, snapshot: dict[str, Any]):
     sim.forward()
     task_env._post_process()
     task_env._update_observables(force=True)
+    # A counterfactual branch restarts the episode clock from its snapshot.
+    # robosuite keeps a monotonic timestep that is only reset by a full
+    # reset().  Without this, the root episode plus every branch accumulate
+    # on the same counter until it crosses horizon, at which point
+    # step() raises ValueError: executing action in terminated episode
+    # and crashes the env subprocess (surfacing as EOFError in the driver and
+    # killing the Ray actors).
+    task_env.timestep = 0
+    task_env.done = False
     return task_env._get_observations()
 
 
