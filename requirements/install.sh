@@ -2057,7 +2057,7 @@ install_openpi_model() {
             install_flash_attn
             popd >/dev/null
             ;;
-        maniskill_libero|libero)
+        maniskill_libero|libero|liberosafety)
             create_and_sync_venv
             install_common_embodied_deps
             install_${ENV_NAME}_env
@@ -2778,7 +2778,7 @@ install_liberosafety_env() {
     uv pip install -e "${source_root}" --no-deps
     # bddl 1.0.1 imports future.utils at runtime but does not declare the
     # dependency in its package metadata.
-    uv pip install "bddl==1.0.1" future easydict "imageio[ffmpeg]" scikit-image usd-core wand
+    uv pip install "bddl==1.0.1" future easydict "imageio[ffmpeg]" scikit-image usd-core wand matplotlib
 
     local config_root="${VIRTUAL_ENV}/share/libero-safety"
     mkdir -p "$config_root"

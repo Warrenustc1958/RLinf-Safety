@@ -1,6 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
+# A host-local RLinf evaluation owns the Ray runtime and its collective ports.
+# Refuse overlapping launchers instead of allowing one job's `ray stop` or Ray
+# startup to kill/corrupt another job on the same machine.
+if [[ "${RLINF_LIBERO_RUN_LOCK_HELD:-0}" != "1" ]]; then
+  RLINF_LIBERO_RUN_LOCK_PATH="${RLINF_LIBERO_RUN_LOCK_PATH:-/tmp/rlinf-libero-run.lock}"
+  exec 9>"${RLINF_LIBERO_RUN_LOCK_PATH}"
+  if ! flock -n 9; then
+    echo "Another RLinf/LIBERO job owns ${RLINF_LIBERO_RUN_LOCK_PATH}." >&2
+    echo "Run natural rollout and Q50 collection sequentially on this host." >&2
+    exit 75
+  fi
+  export RLINF_LIBERO_RUN_LOCK_HELD=1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(dirname "$SCRIPT_DIR")"
 WORKSPACE_ROOT="$(dirname "$REPO_PATH")"

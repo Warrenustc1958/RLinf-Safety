@@ -1560,6 +1560,12 @@ class LiberoEnv(gym.Env):
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
+        if self.counterfactual_branch_collector is not None and chunk_size != 1:
+            raise ValueError(
+                "LIBERO counterfactual branching requires exactly one action per "
+                "policy chunk. Set rollout.model.num_action_chunks=1 so the policy "
+                "replans from the restored snapshot before executing a branch action."
+            )
         obs_list = []
         infos_list = []
 

@@ -6,7 +6,7 @@ def download_huggingface_model():
     repo_id = "LIBERO-Safety/pi05_libero_safety"
     
     # 设置下载后保存在本地的文件夹路径
-    local_dir = "/oss/xujingbo/checkpoints/pi05_libero_safety"
+    local_dir = "/openbayes/input/input2/pi05_libero_safety"
     
     # 确保本地文件夹存在
     os.makedirs(local_dir, exist_ok=True)

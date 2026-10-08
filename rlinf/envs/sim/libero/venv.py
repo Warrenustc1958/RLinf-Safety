@@ -16,6 +16,7 @@ import copy
 import multiprocessing
 import os
 import warnings
+from contextlib import contextmanager
 from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
 
@@ -79,6 +80,74 @@ gym_new_venv_step_type = tuple[
 warnings.simplefilter("once", DeprecationWarning)
 
 LIBERO_CAMERA_OBS_NAMES = ("agentview_image", "robot0_eye_in_hand_image")
+
+
+def _debug_worker_event(message: str) -> None:
+    """Emit sparse subprocess diagnostics when explicitly requested."""
+    if os.environ.get("RLINF_LIBERO_DEBUG", "0") == "1":
+        device = os.environ.get("MUJOCO_EGL_DEVICE_ID", "unset")
+        cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "unset")
+        print(
+            f"[libero-worker pid={os.getpid()} cuda={cuda_devices} "
+            f"egl={device}] {message}",
+            flush=True,
+        )
+
+
+@contextmanager
+def _egl_process_guard():
+    """Optionally serialize EGL work across simulator subprocesses.
+
+    Set ``RLINF_LIBERO_EGL_LOCK_PATH`` to a shared file (for example
+    ``/tmp/rlinf-libero-egl.lock``) to enable this conservative fallback.
+    Set ``RLINF_LIBERO_EGL_LOCK_SCOPE=per_gpu`` to append the Ray worker's
+    isolated ``CUDA_VISIBLE_DEVICES`` value to that path.  This keeps EGL
+    calls serialized within one physical GPU while allowing different GPUs
+    to render concurrently.
+    It is disabled by default because correctly configured EGL drivers can
+    render concurrently.  The lock intentionally covers the full env call:
+    camera observations are produced internally by ``env.step`` / ``reset``.
+    """
+    lock_path = _egl_lock_path()
+    if not lock_path or os.name != "posix":
+        yield
+        return
+
+    import fcntl
+
+    lock_dir = os.path.dirname(os.path.abspath(lock_path))
+    os.makedirs(lock_dir, exist_ok=True)
+    with open(lock_path, "a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _egl_lock_path() -> str:
+    """Resolve the optional global or per-GPU EGL lock path."""
+    lock_path = os.environ.get("RLINF_LIBERO_EGL_LOCK_PATH", "").strip()
+    if not lock_path:
+        return ""
+
+    scope = os.environ.get("RLINF_LIBERO_EGL_LOCK_SCOPE", "global").strip().lower()
+    if scope in {"global", "host"}:
+        return lock_path
+    if scope not in {"per_gpu", "gpu", "device"}:
+        raise ValueError(
+            "RLINF_LIBERO_EGL_LOCK_SCOPE must be global or per_gpu, "
+            f"got {scope!r}"
+        )
+
+    # RLinf gives each Ray worker an isolated CUDA_VISIBLE_DEVICES value.  It
+    # names the physical accelerator even though MuJoCo sees local EGL index 0.
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "unknown").strip()
+    safe_device = "".join(
+        character if character.isalnum() or character in "-_." else "_"
+        for character in visible_devices
+    )
+    return f"{lock_path}.gpu-{safe_device or 'unknown'}"
 
 
 def _normalize_egl_device_id() -> None:
@@ -147,37 +216,154 @@ def _unwrap_task_env(env):
     return task_env
 
 
+def _make_render_context_current(env) -> None:
+    """Re-bind the simulator's offscreen context after non-render RPCs."""
+    task_env = _unwrap_task_env(env)
+    render_context = getattr(task_env.sim, "_render_context_offscreen", None)
+    gl_context = getattr(render_context, "gl_ctx", None)
+    if gl_context is not None:
+        gl_context.make_current()
+
+
+def _checked_snapshot_array(
+    value: Any,
+    *,
+    name: str,
+    expected_shape: tuple[int, ...] | None = None,
+    allow_empty: bool = False,
+) -> np.ndarray:
+    """Return a copied numeric snapshot array or fail before native MuJoCo."""
+    array = np.asarray(value)
+    if not allow_empty and array.size == 0:
+        raise ValueError(f"counterfactual snapshot field {name!r} is empty")
+    if expected_shape is not None and array.shape != expected_shape:
+        raise ValueError(
+            f"counterfactual snapshot field {name!r} has shape {array.shape}, "
+            f"expected {expected_shape}"
+        )
+    if array.dtype.kind not in "biufc":
+        raise TypeError(
+            f"counterfactual snapshot field {name!r} is not numeric: {array.dtype}"
+        )
+    if array.size and not np.isfinite(array).all():
+        raise ValueError(
+            f"counterfactual snapshot field {name!r} contains NaN or Inf"
+        )
+    return array.copy()
+
+
 def _snapshot_simulator_state(env) -> dict[str, Any]:
     """Capture MuJoCo and LIBERO dynamic-obstacle state for branching."""
     task_env = _unwrap_task_env(env)
     sim = task_env.sim
     generators = getattr(task_env, "mocap_motion_generators", {})
-    return {
-        "mujoco_state": sim.get_state().flatten().copy(),
-        "mocap_pos": sim.data.mocap_pos.copy(),
-        "mocap_quat": sim.data.mocap_quat.copy(),
+    state = _checked_snapshot_array(
+        sim.get_state().flatten(), name="mujoco_state"
+    )
+    snapshot = {
+        "version": 2,
+        "mujoco_state": state,
+        "mujoco_state_shape": state.shape,
+        "mocap_pos": _checked_snapshot_array(
+            sim.data.mocap_pos, name="mocap_pos", allow_empty=True
+        ),
+        "mocap_quat": _checked_snapshot_array(
+            sim.data.mocap_quat, name="mocap_quat", allow_empty=True
+        ),
+        "cur_time": float(getattr(task_env, "cur_time", sim.data.time)),
+        "root_timestep": int(getattr(task_env, "timestep", 0)),
         "motion_generators": {
             name: copy.deepcopy(generator.__dict__)
             for name, generator in generators.items()
         },
     }
+    # MjSimState only contains time/qpos/qvel.  Preserve the remaining mutable
+    # integration inputs used by controllers so a branch starts from the same
+    # physical state rather than merely the same visible pose.
+    for field in (
+        "act",
+        "ctrl",
+        "qacc_warmstart",
+        "qfrc_applied",
+        "xfrc_applied",
+    ):
+        if hasattr(sim.data, field):
+            snapshot[field] = _checked_snapshot_array(
+                getattr(sim.data, field), name=field, allow_empty=True
+            )
+
+    # get_state() itself does not render, but explicitly restore the current
+    # EGL context before the immediately following env.step() RPC.
+    _make_render_context_current(env)
+    timestep = int(snapshot["root_timestep"])
+    if timestep < 3 or timestep % 100 == 0:
+        _debug_worker_event(
+            f"snapshot ok timestep={timestep} state_size={state.size}"
+        )
+    return snapshot
 
 
 def _restore_simulator_state(env, snapshot: dict[str, Any]):
     """Restore a branching snapshot and regenerate the corresponding observation."""
     task_env = _unwrap_task_env(env)
     sim = task_env.sim
-    sim.set_state_from_flattened(snapshot["mujoco_state"])
-    sim.data.mocap_pos[:] = snapshot["mocap_pos"]
-    sim.data.mocap_quat[:] = snapshot["mocap_quat"]
+    if not isinstance(snapshot, dict):
+        raise TypeError("counterfactual simulator snapshot must be a dictionary")
+
+    expected_state_shape = np.asarray(sim.get_state().flatten()).shape
+    state = _checked_snapshot_array(
+        snapshot.get("mujoco_state"),
+        name="mujoco_state",
+        expected_shape=expected_state_shape,
+    )
+    mocap_pos = _checked_snapshot_array(
+        snapshot.get("mocap_pos"),
+        name="mocap_pos",
+        expected_shape=sim.data.mocap_pos.shape,
+        allow_empty=True,
+    )
+    mocap_quat = _checked_snapshot_array(
+        snapshot.get("mocap_quat"),
+        name="mocap_quat",
+        expected_shape=sim.data.mocap_quat.shape,
+        allow_empty=True,
+    )
+
+    sim.set_state_from_flattened(state)
+    sim.data.mocap_pos[:] = mocap_pos
+    sim.data.mocap_quat[:] = mocap_quat
+    for field in (
+        "act",
+        "ctrl",
+        "qacc_warmstart",
+        "qfrc_applied",
+        "xfrc_applied",
+    ):
+        if field not in snapshot or not hasattr(sim.data, field):
+            continue
+        target = getattr(sim.data, field)
+        target[:] = _checked_snapshot_array(
+            snapshot[field],
+            name=field,
+            expected_shape=target.shape,
+            allow_empty=True,
+        )
     generators = getattr(task_env, "mocap_motion_generators", {})
     for name, generator_state in snapshot.get("motion_generators", {}).items():
         if name in generators:
             generators[name].__dict__.clear()
             generators[name].__dict__.update(copy.deepcopy(generator_state))
+    if "cur_time" in snapshot:
+        task_env.cur_time = float(snapshot["cur_time"])
     sim.forward()
     task_env._post_process()
-    task_env._update_observables(force=True)
+    # Drop samples and sampling clocks from the future root / previous branch.
+    # Reusing that cache makes a restored physics state appear to have a stale
+    # or empty image, which is especially harmful for visual policies.
+    if hasattr(task_env, "_obs_cache"):
+        task_env._obs_cache = {}
+    for observable in getattr(task_env, "_observables", {}).values():
+        observable.reset()
     # A counterfactual branch restarts the episode clock from its snapshot.
     # robosuite keeps a monotonic timestep that is only reset by a full
     # reset().  Without this, the root episode plus every branch accumulate
@@ -187,7 +373,14 @@ def _restore_simulator_state(env, snapshot: dict[str, Any]):
     # killing the Ray actors).
     task_env.timestep = 0
     task_env.done = False
-    return task_env._get_observations()
+    _make_render_context_current(env)
+    observation = task_env._get_observations(force_update=True)
+    _debug_worker_event(
+        "restore ok "
+        f"root_timestep={snapshot.get('root_timestep', 'unknown')} "
+        f"state_size={state.size}"
+    )
+    return observation
 
 
 def _worker(
@@ -212,6 +405,11 @@ def _worker(
     parent.close()
     _normalize_egl_device_id()
     env = env_fn_wrapper.data()
+    _debug_worker_event(
+        "initialized "
+        f"egl_lock={_egl_lock_path() or 'disabled'}"
+    )
+    worker_step = 0
     try:
         while True:
             try:
@@ -220,7 +418,13 @@ def _worker(
                 p.close()
                 break
             if cmd == "step":
-                env_return = env.step(data)
+                worker_step += 1
+                if worker_step <= 3 or worker_step % 100 == 0:
+                    _debug_worker_event(f"step begin index={worker_step}")
+                with _egl_process_guard():
+                    env_return = env.step(data)
+                if worker_step <= 3 or worker_step % 100 == 0:
+                    _debug_worker_event(f"step end index={worker_step}")
                 current_libero_type = os.environ.get("LIBERO_TYPE", "standard").lower()
                 if current_libero_type == "safe":
                     env_return = list(env_return)
@@ -239,7 +443,8 @@ def _worker(
                     env_return = (None, *env_return[1:])
                 p.send(env_return)
             elif cmd == "reset":
-                retval = env.reset(**data)
+                with _egl_process_guard():
+                    retval = env.reset(**data)
                 reset_returns_info = (
                     isinstance(retval, (tuple, list))
                     and len(retval) == 2
@@ -261,7 +466,8 @@ def _worker(
                 p.close()
                 break
             elif cmd == "render":
-                p.send(env.render(**data) if hasattr(env, "render") else None)
+                with _egl_process_guard():
+                    p.send(env.render(**data) if hasattr(env, "render") else None)
             elif cmd == "seed":
                 if hasattr(env, "seed"):
                     p.send(env.seed(data))
@@ -281,9 +487,11 @@ def _worker(
             elif cmd == "snapshot_simulator_state":
                 p.send(_snapshot_simulator_state(env))
             elif cmd == "restore_simulator_state":
-                p.send(_restore_simulator_state(env, data))
+                with _egl_process_guard():
+                    p.send(_restore_simulator_state(env, data))
             elif cmd == "set_init_state":
-                obs = env.set_init_state(data)
+                with _egl_process_guard():
+                    obs = env.set_init_state(data)
                 p.send(obs)
             elif cmd == "reconfigure":
                 env.close()
@@ -330,14 +538,15 @@ def _worker(
                 h = int(data.get("height", 1024))
                 w = int(data.get("width", 1024))
                 depth = bool(data.get("depth", False))
-                p.send(
-                    sim.render(
-                        width=w,
-                        height=h,
-                        camera_name=cam,
-                        depth=depth,
+                with _egl_process_guard():
+                    p.send(
+                        sim.render(
+                            width=w,
+                            height=h,
+                            camera_name=cam,
+                            depth=depth,
+                        )
                     )
-                )
             elif cmd == "set_camera_rendering":
                 _set_camera_rendering(env, data)
                 p.send(None)
