@@ -841,7 +841,13 @@ class MultiStepRolloutWorker(Worker):
                 desc="Evaluating Rollout Epochs",
                 disable=(self._rank != 0),
             ):
-                for _ in range(self.n_eval_chunk_steps):
+                chunk_steps = tqdm(
+                    range(self.n_eval_chunk_steps),
+                    desc="Evaluating Rollout Steps",
+                    disable=(self._rank != 0),
+                    leave=False,
+                )
+                for _ in chunk_steps:
                     for stage_id in range(self.num_pipeline_stages):
                         env_output = await self.recv_from(
                             group_name=self.cfg.env.group_name,

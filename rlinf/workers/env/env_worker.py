@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import time
 from collections import defaultdict
 from typing import Any
 
@@ -1416,14 +1417,29 @@ class EnvWorker(Worker):
     @Worker.timer("evaluate")
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
         eval_metrics = defaultdict(list)
+        progress_interval = max(
+            1, int(self.cfg.env.eval.get("progress_log_interval", 10))
+        )
         for eval_rollout_epoch in range(self.eval_rollout_epoch):
             if not self.cfg.env.eval.auto_reset or eval_rollout_epoch == 0:
                 for stage_id in range(self.stage_num):
+                    reset_started = time.perf_counter()
+                    self.log_info(
+                        f"[eval-progress] env-rank={self._rank} "
+                        f"epoch={eval_rollout_epoch} stage={stage_id} "
+                        f"reset begin num_envs={self.eval_num_envs_per_stage}"
+                    )
                     self.eval_env_list[stage_id].is_start = True
                     self.eval_prev_done[stage_id] = torch.zeros(
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                    self.log_info(
+                        f"[eval-progress] env-rank={self._rank} "
+                        f"epoch={eval_rollout_epoch} stage={stage_id} "
+                        f"reset end elapsed="
+                        f"{time.perf_counter() - reset_started:.2f}s"
+                    )
                     env_output = EnvOutput(
                         obs=extracted_obs,
                         final_obs=(
@@ -1447,6 +1463,7 @@ class EnvWorker(Worker):
 
             for eval_step in range(self.n_eval_chunk_steps):
                 for stage_id in range(self.stage_num):
+                    chunk_started = time.perf_counter()
                     policy_output = self.recv_from(
                         group_name=self.cfg.rollout.group_name,
                         channel=input_channel,
@@ -1470,6 +1487,22 @@ class EnvWorker(Worker):
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )
+
+                    if (
+                        eval_step == 0
+                        or (eval_step + 1) % progress_interval == 0
+                        or eval_step + 1 == self.n_eval_chunk_steps
+                    ):
+                        done_count = int(
+                            self.eval_prev_done[stage_id].sum().item()
+                        )
+                        self.log_info(
+                            f"[eval-progress] env-rank={self._rank} "
+                            f"epoch={eval_rollout_epoch} stage={stage_id} "
+                            f"chunk={eval_step + 1}/{self.n_eval_chunk_steps} "
+                            f"done={done_count}/{self.eval_num_envs_per_stage} "
+                            f"elapsed={time.perf_counter() - chunk_started:.2f}s"
+                        )
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)

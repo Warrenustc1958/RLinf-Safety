@@ -1,0 +1,119 @@
+env:
+  eval:
+    env_type: libero
+    task_suite_name: affordance
+    safety_level: L0
+    task_id_filter: null
+    total_num_envs: 50
+    auto_reset: false
+    ignore_terminations: false
+    max_steps_per_rollout_epoch: 515
+    max_episode_steps: 512
+    use_rel_reward: true
+    reward_coef: 1.0
+    reset_gripper_open: true
+    is_eval: true
+    seed: 0
+    group_size: 1
+    use_fixed_reset_state_ids: true
+    use_ordered_reset_state_ids: true
+    video_cfg:
+      save_video: false
+      info_on_video: true
+      video_base_dir: /openbayes/home/rlinf-safety-runtime/rollouts/pi05_libero_safety_natural_q/20261007_122430/affordance/affordance_L0/video/eval
+    init_params:
+      camera_heights: 256
+      camera_widths: 256
+    episode_auditor:
+      enabled: true
+      mode: shadow_collect
+      save_dir: /openbayes/home/rlinf-safety-runtime/rollouts/pi05_libero_safety_natural_q/20261007_122430/affordance/affordance_L0/libero_safety_audits
+      include_observations: false
+      save_visual_observations: false
+      visual_camera_keys:
+      - agentview_image
+      severe_collision:
+        hard_stop_predicates:
+        - checkgripperforce
+        max_consecutive_violation_steps: 8
+      counterfactual_branch:
+        enabled: false
+        risk_window_steps: 32
+        max_branches_per_root: 16
+        target_quadrants:
+        - Q2
+        - Q4
+        perturbation_range:
+        - 0.15
+        - 1.0
+        action_dimensions:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+    rollout_epoch: 1
+  group_name: EnvGroup
+rollout:
+  model:
+    model_type: openpi_rlinf
+    precision: null
+    pi05: true
+    is_lora: false
+    lora_rank: 32
+    num_action_chunks: 5
+    action_dim: 7
+    use_proprio: true
+    num_steps: 5
+    add_value_head: false
+    openpi:
+      task: eval
+      config_name: pi05_libero
+      num_images_in_input: 2
+      noise_level: 0.3
+      action_chunk: 5
+      num_steps: 5
+      train_expert_only: true
+      action_env_dim: 7
+      noise_method: flow_sde
+      add_value_head: false
+      value_after_vlm: false
+      value_vlm_mode: mean_token
+      detach_critic_input: false
+      model_action_dim: 32
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      max_token_len: 200
+    model_path: /openbayes/home/rlinf-safety-runtime/checkpoints/pi05_libero_safety_rlinf
+    openpi_data:
+      norm_stats_path: /openbayes/home/rlinf-safety-runtime/checkpoints/pi05_libero_safety_rlinf/assets/lerobot/norm_stats.json
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  pipeline_stage_num: 1
+cluster:
+  num_nodes: 1
+  component_placement:
+    env: 0-1
+    rollout: 0-1
+  tracer:
+    enable: false
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: /openbayes/home/rlinf-safety-runtime/rollouts/pi05_libero_safety_natural_q/20261007_122430/affordance/affordance_L0
+    project_name: rlinf
+    experiment_name: pi05_libero_safety_affordance_L0
+    logger_backends:
+    - tensorboard
+  max_epochs: 1000
+  max_steps: -1
+  only_eval: true
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+  per_worker_log: false
+  per_worker_log_path: null
+  weight_sync_interval: 1
+  overlap_env_bootstrap: false

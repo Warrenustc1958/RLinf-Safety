@@ -8,6 +8,13 @@ auto_reset: False
 ignore_terminations: False
 max_steps_per_rollout_epoch: 512
 max_episode_steps: 512
+# Open-loop action chunks only need a camera observation after their final
+# action.  Keep this opt-in because visual audit collection with chunk_size>1
+# requires every intermediate frame; natural rollout can safely enable it.
+skip_intermediate_renders: false
+# Emit worker-side timing often enough to distinguish reset / inference /
+# simulator stalls without logging every environment step.
+progress_log_interval: 10
 
 use_rel_reward: True
 reward_coef: 1.0
