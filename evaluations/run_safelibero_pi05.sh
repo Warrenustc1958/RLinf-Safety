@@ -41,7 +41,7 @@ source "${VENV_PATH}/bin/activate"
 cd "$REPO_PATH"
 
 export LIBERO_TYPE=safety
-export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${WORKSPACE_ROOT}/.venv-openvlaoft-libero-safety/share/libero-safety}"
+export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${VENV_PATH}/share/libero-safety}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 export EMBODIED_PATH="${REPO_PATH}/examples/embodiment"

@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import os
 import time
 from collections import defaultdict
 from typing import Any
@@ -57,6 +58,34 @@ from rlinf.utils.utils import (
     pack_batch,
     preprocess_embodied_batch,
 )
+
+
+def _eval_debug_event(rank: int, message: str) -> None:
+    """Print a flush-safe evaluation trace when debugging is enabled."""
+    if os.environ.get("RLINF_EVAL_DEBUG", "0") == "1":
+        print(
+            f"[eval-debug env rank={rank} pid={os.getpid()}] {message}",
+            flush=True,
+        )
+
+
+def _enable_debug_stack_dumps(component: str, rank: int) -> None:
+    """Periodically dump Python stacks so a silent native wait is locatable."""
+    raw_interval = os.environ.get("RLINF_DEBUG_STACK_INTERVAL", "0").strip()
+    try:
+        interval = int(raw_interval or "0")
+    except ValueError:
+        interval = 0
+    if interval <= 0:
+        return
+    import faulthandler
+
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(interval, repeat=True)
+    _eval_debug_event(
+        rank,
+        f"enabled {component} Python stack dumps every {interval}s",
+    )
 
 
 class EnvWorker(Worker):
@@ -250,6 +279,8 @@ class EnvWorker(Worker):
         ]
 
     def init_worker(self):
+        _enable_debug_stack_dumps("EnvGroup", self._rank)
+        _eval_debug_event(self._rank, "init_worker enter")
         # This is a barrier to ensure all envs' initial setup upon import is done
         # Essential for RealWorld env to ensure initial ROS node setup is done
         self.broadcast(
@@ -292,6 +323,11 @@ class EnvWorker(Worker):
                 self.history_lengths = [{} for _ in range(self.stage_num)]
 
         self._init_env()
+        _eval_debug_event(
+            self._rank,
+            f"init_worker exit eval_envs_per_stage="
+            f"{getattr(self, 'eval_num_envs_per_stage', 0)}",
+        )
 
     def update_env_cfg(self):
         if self.enable_train:
@@ -1420,10 +1456,20 @@ class EnvWorker(Worker):
         progress_interval = max(
             1, int(self.cfg.env.eval.get("progress_log_interval", 10))
         )
+        _eval_debug_event(
+            self._rank,
+            f"evaluate enter epochs={self.eval_rollout_epoch} "
+            f"chunks={self.n_eval_chunk_steps} stages={self.stage_num}",
+        )
         for eval_rollout_epoch in range(self.eval_rollout_epoch):
             if not self.cfg.env.eval.auto_reset or eval_rollout_epoch == 0:
                 for stage_id in range(self.stage_num):
                     reset_started = time.perf_counter()
+                    _eval_debug_event(
+                        self._rank,
+                        f"epoch={eval_rollout_epoch} stage={stage_id} reset begin "
+                        f"num_envs={self.eval_num_envs_per_stage}",
+                    )
                     self.log_info(
                         f"[eval-progress] env-rank={self._rank} "
                         f"epoch={eval_rollout_epoch} stage={stage_id} "
@@ -1434,6 +1480,11 @@ class EnvWorker(Worker):
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                    _eval_debug_event(
+                        self._rank,
+                        f"epoch={eval_rollout_epoch} stage={stage_id} reset end "
+                        f"elapsed={time.perf_counter() - reset_started:.2f}s",
+                    )
                     self.log_info(
                         f"[eval-progress] env-rank={self._rank} "
                         f"epoch={eval_rollout_epoch} stage={stage_id} "
@@ -1450,6 +1501,11 @@ class EnvWorker(Worker):
                         env_infos=infos if isinstance(infos, dict) else None,
                     )
                     env_batch = env_output.to_dict()
+                    _eval_debug_event(
+                        self._rank,
+                        f"epoch={eval_rollout_epoch} stage={stage_id} "
+                        "bootstrap obs send begin",
+                    )
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
@@ -1460,10 +1516,27 @@ class EnvWorker(Worker):
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         decoupled_mode=self.env_decoupled_mode,
                     )
+                    _eval_debug_event(
+                        self._rank,
+                        f"epoch={eval_rollout_epoch} stage={stage_id} "
+                        "bootstrap obs send end",
+                    )
 
             for eval_step in range(self.n_eval_chunk_steps):
                 for stage_id in range(self.stage_num):
                     chunk_started = time.perf_counter()
+                    trace_step = (
+                        eval_step == 0
+                        or (eval_step + 1) % progress_interval == 0
+                        or eval_step + 1 == self.n_eval_chunk_steps
+                    )
+                    if trace_step:
+                        _eval_debug_event(
+                            self._rank,
+                            f"epoch={eval_rollout_epoch} stage={stage_id} "
+                            f"chunk={eval_step + 1}/{self.n_eval_chunk_steps} "
+                            "action recv begin",
+                        )
                     policy_output = self.recv_from(
                         group_name=self.cfg.rollout.group_name,
                         channel=input_channel,
@@ -1475,6 +1548,13 @@ class EnvWorker(Worker):
                         else None,
                         decoupled_mode=self.env_decoupled_mode,
                     )
+                    if trace_step:
+                        _eval_debug_event(
+                            self._rank,
+                            f"epoch={eval_rollout_epoch} stage={stage_id} "
+                            f"chunk={eval_step + 1}/{self.n_eval_chunk_steps} "
+                            "action recv end",
+                        )
                     raw_chunk_actions = (
                         policy_output.actions
                         if hasattr(policy_output, "actions")
@@ -1484,9 +1564,23 @@ class EnvWorker(Worker):
                         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
                     else:
                         raw_chunk_actions = np.asarray(raw_chunk_actions)
+                    if trace_step:
+                        _eval_debug_event(
+                            self._rank,
+                            f"epoch={eval_rollout_epoch} stage={stage_id} "
+                            f"chunk={eval_step + 1}/{self.n_eval_chunk_steps} "
+                            f"env step begin actions_shape={raw_chunk_actions.shape}",
+                        )
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )
+                    if trace_step:
+                        _eval_debug_event(
+                            self._rank,
+                            f"epoch={eval_rollout_epoch} stage={stage_id} "
+                            f"chunk={eval_step + 1}/{self.n_eval_chunk_steps} "
+                            "env step end",
+                        )
 
                     if (
                         eval_step == 0
@@ -1517,6 +1611,13 @@ class EnvWorker(Worker):
                         if eval_step == self.n_eval_chunk_steps - 1:
                             continue
                     env_batch = env_output.to_dict()
+                    if trace_step:
+                        _eval_debug_event(
+                            self._rank,
+                            f"epoch={eval_rollout_epoch} stage={stage_id} "
+                            f"chunk={eval_step + 1}/{self.n_eval_chunk_steps} "
+                            "next obs send begin",
+                        )
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
@@ -1527,6 +1628,13 @@ class EnvWorker(Worker):
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         decoupled_mode=self.env_decoupled_mode,
                     )
+                    if trace_step:
+                        _eval_debug_event(
+                            self._rank,
+                            f"epoch={eval_rollout_epoch} stage={stage_id} "
+                            f"chunk={eval_step + 1}/{self.n_eval_chunk_steps} "
+                            "next obs send end",
+                        )
 
             self.finish_rollout(mode="eval")
         for stage_id in range(self.stage_num):
@@ -1536,6 +1644,7 @@ class EnvWorker(Worker):
         for key, value in eval_metrics.items():
             eval_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
+        _eval_debug_event(self._rank, "evaluate exit")
         return eval_metrics
 
     def get_actor_split_num(self):

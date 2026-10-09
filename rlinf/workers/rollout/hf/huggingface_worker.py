@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import os
 import time
 from typing import Any, Callable, Literal, Optional
 
@@ -36,6 +37,33 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.obs_compression import decompress_obs, infer_obs_batch_size
 from rlinf.utils.placement import HybridComponentPlacement
+
+
+def _eval_debug_event(rank: int, message: str) -> None:
+    """Print a flush-safe evaluation trace when debugging is enabled."""
+    if os.environ.get("RLINF_EVAL_DEBUG", "0") == "1":
+        print(
+            f"[eval-debug rollout rank={rank} pid={os.getpid()}] {message}",
+            flush=True,
+        )
+
+
+def _enable_debug_stack_dumps(component: str, rank: int) -> None:
+    raw_interval = os.environ.get("RLINF_DEBUG_STACK_INTERVAL", "0").strip()
+    try:
+        interval = int(raw_interval or "0")
+    except ValueError:
+        interval = 0
+    if interval <= 0:
+        return
+    import faulthandler
+
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(interval, repeat=True)
+    _eval_debug_event(
+        rank,
+        f"enabled {component} Python stack dumps every {interval}s",
+    )
 
 
 class MultiStepRolloutWorker(Worker):
@@ -139,6 +167,8 @@ class MultiStepRolloutWorker(Worker):
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
 
     def init_worker(self):
+        _enable_debug_stack_dumps("RolloutGroup", self._rank)
+        _eval_debug_event(self._rank, "init_worker enter")
         rollout_model_config = copy.deepcopy(self.model_cfg)
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
@@ -191,6 +221,7 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+        _eval_debug_event(self._rank, "init_worker exit")
 
     def setup_sample_params(self):
         # sampling parameters for rollout
@@ -802,6 +833,11 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("evaluate")
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
+        _eval_debug_event(
+            self._rank,
+            f"evaluate enter epochs={self.eval_rollout_epoch} "
+            f"chunks={self.n_eval_chunk_steps} stages={self.num_pipeline_stages}",
+        )
         if self.enable_offload:
             self.reload_model()
         if self.env_decoupled_mode:
@@ -847,8 +883,22 @@ class MultiStepRolloutWorker(Worker):
                     disable=(self._rank != 0),
                     leave=False,
                 )
-                for _ in chunk_steps:
+                progress_interval = max(
+                    1, int(self.cfg.env.eval.get("progress_log_interval", 10))
+                )
+                for eval_step in chunk_steps:
                     for stage_id in range(self.num_pipeline_stages):
+                        trace_step = (
+                            eval_step == 0
+                            or (eval_step + 1) % progress_interval == 0
+                            or eval_step + 1 == self.n_eval_chunk_steps
+                        )
+                        if trace_step:
+                            _eval_debug_event(
+                                self._rank,
+                                f"stage={stage_id} chunk={eval_step + 1}/"
+                                f"{self.n_eval_chunk_steps} obs recv begin",
+                            )
                         env_output = await self.recv_from(
                             group_name=self.cfg.env.group_name,
                             channel=input_channel,
@@ -859,6 +909,19 @@ class MultiStepRolloutWorker(Worker):
                             merge_fn=self._merge_obs_batches,
                             infer_batch_size_fn=self._infer_env_batch_size,
                         ).async_wait()
+                        if trace_step:
+                            _eval_debug_event(
+                                self._rank,
+                                f"stage={stage_id} chunk={eval_step + 1}/"
+                                f"{self.n_eval_chunk_steps} obs recv end",
+                            )
+                        predict_started = time.perf_counter()
+                        if trace_step:
+                            _eval_debug_event(
+                                self._rank,
+                                f"stage={stage_id} chunk={eval_step + 1}/"
+                                f"{self.n_eval_chunk_steps} predict begin",
+                            )
                         actions, _ = self._predict_rollout_actions(
                             env_output["obs"],
                             mode="eval",
@@ -866,8 +929,21 @@ class MultiStepRolloutWorker(Worker):
                             rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                             intervene_requested=env_output.get("intervene_flags", None),
                         )
+                        if trace_step:
+                            _eval_debug_event(
+                                self._rank,
+                                f"stage={stage_id} chunk={eval_step + 1}/"
+                                f"{self.n_eval_chunk_steps} predict end "
+                                f"elapsed={time.perf_counter() - predict_started:.2f}s",
+                            )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
+                        if trace_step:
+                            _eval_debug_event(
+                                self._rank,
+                                f"stage={stage_id} chunk={eval_step + 1}/"
+                                f"{self.n_eval_chunk_steps} action send begin",
+                            )
                         self.send_to(
                             group_name=self.cfg.env.group_name,
                             channel=output_channel,
@@ -877,9 +953,16 @@ class MultiStepRolloutWorker(Worker):
                             async_op=True,
                             batch_size=self.eval_batch_size,
                         )
+                        if trace_step:
+                            _eval_debug_event(
+                                self._rank,
+                                f"stage={stage_id} chunk={eval_step + 1}/"
+                                f"{self.n_eval_chunk_steps} action send end",
+                            )
 
             if self.enable_offload:
                 self.offload_model()
+        _eval_debug_event(self._rank, "evaluate exit")
 
     def offload_model(self):
         if self.enable_cuda_graph:

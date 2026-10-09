@@ -15,6 +15,7 @@
 import copy
 import multiprocessing
 import os
+import time
 import warnings
 from contextlib import contextmanager
 from multiprocessing import connection
@@ -118,11 +119,18 @@ def _egl_process_guard():
     lock_dir = os.path.dirname(os.path.abspath(lock_path))
     os.makedirs(lock_dir, exist_ok=True)
     with open(lock_path, "a+b") as lock_file:
+        wait_started = time.perf_counter()
+        _debug_worker_event(f"EGL lock wait path={lock_path}")
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        _debug_worker_event(
+            f"EGL lock acquired path={lock_path} "
+            f"waited={time.perf_counter() - wait_started:.3f}s"
+        )
         try:
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            _debug_worker_event(f"EGL lock released path={lock_path}")
 
 
 def _egl_lock_path() -> str:
@@ -389,6 +397,17 @@ def _worker(
     env_fn_wrapper: CloudpickleWrapper,
     obs_bufs: Optional[Union[dict, tuple, ShArray]] = None,
 ) -> None:
+    raw_stack_interval = os.environ.get("RLINF_DEBUG_STACK_INTERVAL", "0").strip()
+    try:
+        stack_interval = int(raw_stack_interval or "0")
+    except ValueError:
+        stack_interval = 0
+    if stack_interval > 0:
+        import faulthandler
+
+        faulthandler.enable()
+        faulthandler.dump_traceback_later(stack_interval, repeat=True)
+
     def _encode_obs(
         obs: Union[dict, tuple, np.ndarray], buffer: Union[dict, tuple, ShArray]
     ) -> None:
@@ -443,8 +462,10 @@ def _worker(
                     env_return = (None, *env_return[1:])
                 p.send(env_return)
             elif cmd == "reset":
+                _debug_worker_event("reset begin")
                 with _egl_process_guard():
                     retval = env.reset(**data)
+                _debug_worker_event("reset end")
                 reset_returns_info = (
                     isinstance(retval, (tuple, list))
                     and len(retval) == 2
@@ -490,14 +511,18 @@ def _worker(
                 with _egl_process_guard():
                     p.send(_restore_simulator_state(env, data))
             elif cmd == "set_init_state":
+                _debug_worker_event("set_init_state begin")
                 with _egl_process_guard():
                     obs = env.set_init_state(data)
+                _debug_worker_event("set_init_state end")
                 p.send(obs)
             elif cmd == "reconfigure":
+                _debug_worker_event("reconfigure begin")
                 env.close()
                 seed = data.pop("seed")
                 env = OffScreenRenderEnv(**data)
                 env.seed(seed)
+                _debug_worker_event("reconfigure end")
                 p.send(None)
             elif cmd == "get_camera_meta":
                 # Compute camera intrinsics/extrinsics and depth near/far
