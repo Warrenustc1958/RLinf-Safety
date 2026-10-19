@@ -33,6 +33,7 @@ def make_libero_example() -> dict:
 
 
 _WRIST_MODE_LOGGED = False
+_STATE_MODE_LOGGED = False
 
 
 def _parse_image(image) -> np.ndarray:
@@ -83,9 +84,22 @@ class LiberoInputs(transforms.DataTransformFn):
                 print(f"[libero_policy] RLINF_PI05_WRIST_MODE={wrist_mode}", flush=True)
                 _WRIST_MODE_LOGGED = True
 
+        # State ablation (eval only): RLINF_PI05_STATE_MODE=real|zero.
+        #   zero: raw proprio state replaced by zeros before normalization.
+        state = data["observation/state"]
+        state_mode = os.environ.get("RLINF_PI05_STATE_MODE", "real")
+        if state_mode == "zero":
+            state = np.zeros_like(state)
+            global _STATE_MODE_LOGGED
+            if not _STATE_MODE_LOGGED:
+                print(f"[libero_policy] RLINF_PI05_STATE_MODE={state_mode}", flush=True)
+                _STATE_MODE_LOGGED = True
+        elif state_mode != "real":
+            raise ValueError(f"unknown RLINF_PI05_STATE_MODE={state_mode!r}")
+
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
-            "state": data["observation/state"],
+            "state": state,
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,

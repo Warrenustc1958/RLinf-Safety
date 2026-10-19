@@ -105,11 +105,11 @@ run_cell() {
 if [ "$MODE" = smoke ]; then
   run_cell "$SUITE" "${LEVEL^^}" 1 10 10 '[0]'
 elif [ "$MODE" = cell ]; then
-  run_cell "$SUITE" "${LEVEL^^}" "$TOTAL_ENVS" 512 515 ''
+  run_cell "$SUITE" "${LEVEL^^}" "$TOTAL_ENVS" 512 "${MAX_ROLLOUT_STEPS:-515}" ''
 else
   for suite in affordance human_safety obstacle_avoidance obstacle_avoidance_human; do
     for level in L0 L1 L2; do
-      run_cell "$suite" "$level" "$TOTAL_ENVS" 512 515 ''
+      run_cell "$suite" "$level" "$TOTAL_ENVS" 512 "${MAX_ROLLOUT_STEPS:-515}" ''
     done
   done
 fi
