@@ -74,6 +74,8 @@ def main():
     parser.add_argument("--static_video_prob", type=float, default=0.05)
     parser.add_argument("--val_interval", type=int, default=1)
     parser.add_argument("--bench-loader", type=int, default=0)
+    parser.add_argument("--keep_last", type=int, default=1, help="keep only the newest N step ckpts (0 = all)")
+    parser.add_argument("--action_lr", type=float, default=None, help="separate lr for action_mlp* (default: same)")
     args = parser.parse_args()
 
     train = TrainerDataset(WanACSFTDataset(args.index, "train", args.view, args.train_length, args.seed))
@@ -111,6 +113,18 @@ def main():
         static_video_prob=args.static_video_prob,
     )
 
+    if args.action_lr is not None:
+        # Separate learning rate for the action-injection MLPs via optimizer param
+        # groups; the reference trainer passes trainable_modules() to AdamW.
+        act = [p for n, p in model.named_parameters() if p.requires_grad and "action_mlp" in n]
+        act_ids = {id(p) for p in act}
+        rest = [p for p in model.parameters() if p.requires_grad and id(p) not in act_ids]
+        if not act:
+            raise ValueError("--action_lr given but no trainable action_mlp parameters found")
+        model.trainable_modules = lambda: [{"params": rest}, {"params": act, "lr": args.action_lr}]
+        print(f"[action_lr] {len(act)} action_mlp tensors at lr {args.action_lr}, "
+              f"{len(rest)} other tensors at lr {args.learning_rate}", flush=True)
+
     out = Path(args.output_path)
     out.mkdir(parents=True, exist_ok=True)
     stats = (out / "step_stats.jsonl").open("w")
@@ -128,6 +142,13 @@ def main():
                                         "max_mem_gb": torch.cuda.max_memory_allocated() / 2**30}) + "\n")
                 stats.flush()
             self._t = now
+
+        def save_model(self, accelerator, model, file_name):
+            super().save_model(accelerator, model, file_name)
+            if accelerator.is_main_process and args.keep_last > 0:
+                ckpts = sorted(out.glob("step-*.safetensors"), key=lambda p: int(p.stem.split("-")[1]))
+                for old in ckpts[:-args.keep_last]:
+                    old.unlink()
 
     logger = TimedLogger(args.output_path, remove_prefix_in_ckpt=args.remove_prefix_in_ckpt)
     ref.launch_training_task(train, val, model, logger, args=args)
