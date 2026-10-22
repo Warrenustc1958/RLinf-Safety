@@ -59,7 +59,12 @@ def main():
     ap.add_argument("--pose_scale", type=float, default=1.0,
                     help="must match the value the checkpoint was trained with")
     ap.add_argument("--pose_clip", type=float, default=4.0, help="must match training (0 = no cap)")
+    ap.add_argument("--view", default="agent", choices=["agent", "dual"],
+                    help="dual: agent stacked over wrist (dual_view.py); metrics per view")
+    ap.add_argument("--dual_roots", action="store_true",
+                    help="only roots with a wrist view (same root set as --view dual, for agent-view comparison)")
     args = ap.parse_args()
+    dual = args.view == "dual"
 
     from diffsynth.pipelines.wan_video_new import ModelConfig, WanVideoPipeline
     import lpips
@@ -69,10 +74,16 @@ def main():
         ModelConfig(path=args.dit, offload_device="cpu"), ModelConfig(path=args.vae, offload_device="cpu")])
     pipe.dit.to(dev)
     pipe.vae.to(dev)
+    if dual:
+        from toolkits.libero_safety.wan_ac_sft.dual_view import enable_dual
+        enable_dual(pipe)
     metric = lpips.LPIPS(net="alex").to(dev).eval()
 
     T = args.chunks * 8
     rows = [r for r in load_manifest(args.index, "test") if r["kind"] == "root" and r["num_frames"] >= T + 1]
+    if dual or args.dual_roots:
+        rows = [r for r in rows if r.get("dual") and r.get("wrist_segments")]
+    H = 512 if dual else 256
     rng = np.random.default_rng(0)
     picks = []
     for q in QUADRANTS:
@@ -93,7 +104,7 @@ def main():
             a = np.concatenate([NULL_ACTION[None], mem_act, chunk_act], 0)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = pipe(seed=seed + 1000 * c, tiled=False, input_image=[anchor], input_image4=[memory],
-                           action=torch.from_numpy(a).unsqueeze(0).to(dev), height=256, width=256,
+                           action=torch.from_numpy(a).unsqueeze(0).to(dev), height=H, width=256,
                            num_frames=13, num_inference_steps=args.steps, cfg_scale=1.0,
                            progress_bar_cmd=lambda x: x, batch_size=1)
             new = [np.asarray(im, np.uint8) for im in out[0][5:]]
@@ -108,35 +119,52 @@ def main():
             d = metric(t(a), t(b)).flatten().cpu().numpy()
         return d.reshape(args.chunks, 8).mean(1)
 
+    def view_metrics(real, shuf, f0, fut):
+        return {"err_real": lp_chunks(real[0], fut).tolist(), "err_shuf": lp_chunks(shuf[0], fut).tolist(),
+                "err_copy": lp_chunks(np.repeat(f0[None], T, 0), fut).tolist(),
+                "div_action": lp_chunks(real[0], shuf[0]).tolist(),
+                "div_seed": np.mean([lp_chunks(real[0], real[s]) for s in range(1, args.seeds)], 0).tolist(),
+                "div_action_s1": lp_chunks(real[1], shuf[1]).tolist()}
+
     results, t0 = [], time.time()
     for k, r in enumerate(picks):
         gt = load_frames(r["agent_segments"], list(range(T + 1)), "agentview_image")
-        f0, fut = gt[0], gt[1:]
+        if dual:
+            gw = load_frames(r["wrist_segments"], list(range(T + 1)), "robot0_eye_in_hand_image")
+            gt_in = np.concatenate([gt, gw], axis=1)       # agent over wrist
+        else:
+            gt_in = gt
         others = [o for o in rows if o["task"] != r["task"] or o["suite"] != r["suite"]]
         other = others[int(rng.integers(len(others)))]
-        real = [rollout(f0, actions_of(r), s) for s in range(args.seeds)]
-        shuf = [rollout(f0, actions_of(other), s) for s in range(2)]
+        real = [rollout(gt_in[0], actions_of(r), s) for s in range(args.seeds)]
+        shuf = [rollout(gt_in[0], actions_of(other), s) for s in range(2)]
+        top = lambda xs: [x[:, :256] for x in xs]
         rec = {"idx": r["idx"], "cell": r["cell"], "task": r["task"], "quadrant": r["quadrant"],
-               "other_idx": other["idx"],
-               "err_real": lp_chunks(real[0], fut).tolist(), "err_shuf": lp_chunks(shuf[0], fut).tolist(),
-               "err_copy": lp_chunks(np.repeat(f0[None], T, 0), fut).tolist(),
-               "div_action": lp_chunks(real[0], shuf[0]).tolist(),
-               "div_seed": np.mean([lp_chunks(real[0], real[s]) for s in range(1, args.seeds)], 0).tolist(),
-               "div_action_s1": lp_chunks(real[1], shuf[1]).tolist()}
+               "other_idx": other["idx"]}
+        rec.update(view_metrics(top(real), top(shuf), gt[0], gt[1:]))   # agent view (main keys)
+        if dual:
+            bot = lambda xs: [x[:, 256:] for x in xs]
+            rec["wrist"] = view_metrics(bot(real), bot(shuf), gw[0], gw[1:])
         results.append(rec)
         print(f"[{k + 1}/{len(picks)}] {time.time() - t0:.0f}s {r['cell']} {r['quadrant']} "
               f"last-chunk err_real={rec['err_real'][-1]:.3f} err_copy={rec['err_copy'][-1]:.3f} "
               f"div_action={rec['div_action'][-1]:.3f} div_seed={rec['div_seed'][-1]:.3f}", flush=True)
 
     keys = ("err_real", "err_shuf", "err_copy", "div_action", "div_seed", "div_action_s1")
-    curve = {k: np.mean([x[k] for x in results], 0).tolist() for k in keys}
-    ratio = (np.array(curve["div_action"]) / np.maximum(np.array(curve["div_seed"]), 1e-9)).tolist()
-    summary = {"n": len(results), "chunks": args.chunks, "seeds": args.seeds, "curve": curve,
-               "div_action_over_div_seed": ratio,
-               "frac_real_beats_shuf": [float(np.mean([x["err_real"][c] < x["err_shuf"][c] for x in results]))
-                                        for c in range(args.chunks)],
-               "frac_real_beats_copy": [float(np.mean([x["err_real"][c] < x["err_copy"][c] for x in results]))
-                                        for c in range(args.chunks)]}
+
+    def summarize(recs):
+        curve = {k: np.mean([x[k] for x in recs], 0).tolist() for k in keys}
+        ratio = (np.array(curve["div_action"]) / np.maximum(np.array(curve["div_seed"]), 1e-9)).tolist()
+        return {"curve": curve, "div_action_over_div_seed": ratio,
+                "frac_real_beats_shuf": [float(np.mean([x["err_real"][c] < x["err_shuf"][c] for x in recs]))
+                                         for c in range(args.chunks)],
+                "frac_real_beats_copy": [float(np.mean([x["err_real"][c] < x["err_copy"][c] for x in recs]))
+                                         for c in range(args.chunks)]}
+
+    summary = {"n": len(results), "chunks": args.chunks, "seeds": args.seeds, "view": args.view,
+               "dual_roots": bool(dual or args.dual_roots), **summarize(results)}
+    if dual:
+        summary["wrist"] = summarize([x["wrist"] for x in results])
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps({"summary": summary, "episodes": results}, indent=1))
     print(json.dumps(summary, indent=1))

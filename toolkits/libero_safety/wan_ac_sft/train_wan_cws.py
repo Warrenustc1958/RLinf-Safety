@@ -47,6 +47,7 @@ import torch
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 
+from toolkits.libero_safety.wan_ac_sft.dual_view import enable_dual, stack_pil
 from toolkits.libero_safety.wan_ac_sft.fp32_master import patch_flash_attention, to_fp32_master
 from toolkits.libero_safety.wan_ac_sft.sampler import WanACSFTDataset
 from toolkits.libero_safety.wan_ac_sft.train_wan_ac_sft import _load_reference_trainer
@@ -56,11 +57,20 @@ PREFIX = "pipe.dit."
 BINS = ("template", "lt2", "2to5", "ge5")
 
 
+def as_trainer_item(it, dual):
+    """Dataset item -> trainer dict; dual stacks agent over wrist (dual_view.stack_pil)."""
+    if dual:
+        video = stack_pil(it["video"], it["wrist_video"])
+        return {"video": video, "reference_image": [video[0]], "action": torch.from_numpy(it["action"])}
+    return {"video": it["video"], "reference_image": it["reference_image"], "action": torch.from_numpy(it["action"])}
+
+
 class ItemDataset(torch.utils.data.Dataset):
     """WanACSFTDataset item -> trainer dict; a failed read retries another index."""
 
     def __init__(self, inner, tries=5):
         self.inner, self.tries = inner, tries
+        self.dual = getattr(inner, "view", "agent") == "dual"
 
     def __len__(self):
         return len(self.inner)
@@ -71,8 +81,7 @@ class ItemDataset(torch.utils.data.Dataset):
             j = (i + k * 7919) % len(self.inner)
             try:
                 it = self.inner[j]
-                return {"video": it["video"], "reference_image": it["reference_image"],
-                        "action": torch.from_numpy(it["action"])}
+                return as_trainer_item(it, self.dual)
             except Exception as e:  # NFS hiccup, truncated npz, ...
                 last = e
                 print(f"[data] item {j} failed ({e!r}), retrying", flush=True)
@@ -156,6 +165,8 @@ def main():
     ap.add_argument("--max_bad", type=int, default=50)
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--seed", type=int, default=21)
+    ap.add_argument("--view", default="agent", choices=["agent", "dual"],
+                    help="dual = agentview stacked over wrist, latent-level concat (dual_view.py)")
     args = ap.parse_args()
 
     out = Path(args.output)
@@ -191,6 +202,8 @@ def main():
                                 extra_inputs="input_image,action", static_video_prob=args.static_video_prob,
                                 context_noise_sigma=0.0)
     net.pipe.device = acc.device
+    if args.view == "dual":
+        enable_dual(net.pipe)
     named = [(n, p) for n, p in net.named_parameters() if p.requires_grad]
     if prog and fallback is None:  # fp32 weights of the resume point
         sd = torch.load(out / "resume" / "model_fp32.pt", map_location="cpu", weights_only=True)
@@ -216,7 +229,7 @@ def main():
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda k: lr_factor(k + start, args.warmup, args.max_steps, args.lr_floor))
 
-    train = ItemDataset(WanACSFTDataset(args.index, "train", "agent", 50_000_000, args.seed,
+    train = ItemDataset(WanACSFTDataset(args.index, "train", args.view, 50_000_000, args.seed,
                                         motion_weight=bool(args.motion_weight), motion_power=args.motion_power,
                                         motion_floor=args.motion_floor, pose_scale=args.pose_scale,
                                         pose_clip=args.pose_clip))
@@ -249,7 +262,7 @@ def main():
     ema_params = [params[i] for i in mine]
 
     # fixed validation set (uniform windows, held-out init states)
-    val_ds = WanACSFTDataset(args.index, "val", "agent", args.val_items, args.seed + 1, motion_weight=False,
+    val_ds = WanACSFTDataset(args.index, "val", args.view, args.val_items, args.seed + 1, motion_weight=False,
                              pose_scale=args.pose_scale, pose_clip=args.pose_clip)
     val_bins = []
     for i in range(args.val_items):
@@ -263,8 +276,7 @@ def main():
         with torch.no_grad():
             for i in range(acc.process_index, args.val_items, acc.num_processes):
                 it = val_ds[i]
-                d = {"video": it["video"], "reference_image": it["reference_image"],
-                     "action": torch.from_numpy(it["action"])}
+                d = as_trainer_item(it, args.view == "dual")
                 with torch.random.fork_rng(devices=[acc.device]):
                     torch.manual_seed(1_000_000 + i)
                     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -304,7 +316,7 @@ def main():
             else:
                 shutil.rmtree(tmp, ignore_errors=True)
                 tmp.mkdir()
-        if float(acc.reduce(ok, reduction="min")) == 0:
+        if float(acc.gather(ok).min()) == 0:  # rank 0's skip decision reaches every rank
             acc.wait_for_everyone()
             return
         acc.wait_for_everyone()
@@ -412,7 +424,8 @@ def main():
         if step % args.save_every == 0 or step == args.max_steps:
             save(step)
     if acc.is_main_process:
-        p = json.loads((out / "progress.json").read_text())
+        pf = out / "progress.json"
+        p = json.loads(pf.read_text()) if pf.exists() else {}
         if p.get("opt_step") == args.max_steps:
             p["done"] = True
             atomic_json(out / "progress.json", p)
