@@ -45,6 +45,7 @@ from PIL import Image
 from toolkits.libero_safety.wan_ac_sft.sampler import NULL_ACTION, load_frames, load_manifest, scale_pose
 
 PI05 = "/mnt/nfs/fjj/Code/rlinf-safety-runtime/checkpoints/pi05_libero_safety_rlinf"
+REPO = "/mnt/nfs/fjj/Code/RLinf-Safety"
 CONDS = ("real", "floor", "wan", "mask", "both")
 
 
@@ -62,14 +63,19 @@ def state_of(obs):
                            obs["robot0_gripper_qpos"]]).astype(np.float32)
 
 
-def load_pi05(dev):
+def load_pi05(dev, chunk=8):
+    """Same model path as the real eval: model/pi0_5_rlinf.yaml (openpi_rlinf) + the
+    libero_safety eval overrides, num_action_chunks = ``chunk``."""
     from omegaconf import OmegaConf
-    from rlinf.models.embodiment.openpi import get_model
-    cfg = OmegaConf.create({
-        "model_path": PI05,
+    from rlinf.models.embodiment.openpi_rlinf import get_model
+    base = OmegaConf.load(REPO + "/examples/embodiment/config/model/pi0_5_rlinf.yaml")
+    over = OmegaConf.create({
+        "model_path": PI05, "num_action_chunks": chunk, "action_dim": 7, "num_steps": 5,
         "openpi": {"task": "eval", "config_name": "pi05_libero", "num_images_in_input": 2, "num_steps": 5,
-                   "noise_method": "flow_sde", "noise_level": 0.3, "action_chunk": 8, "action_env_dim": 7},
+                   "noise_method": "flow_sde", "noise_level": 0.3},
         "openpi_data": {"norm_stats_path": f"{PI05}/assets/lerobot/norm_stats.json"}})
+    cfg = OmegaConf.merge(base, over)
+    OmegaConf.resolve(cfg)
     return get_model(cfg).to(dev).eval()
 
 
@@ -83,7 +89,8 @@ def predict(policy, agent, wrist, state, prompt, seed, wrist_mode="real"):
            "wrist_images": torch.from_numpy(np.ascontiguousarray(wrist)),
            "states": torch.from_numpy(np.ascontiguousarray(state)),
            "task_descriptions": [prompt] * b, "extra_view_images": None}
-    act, _ = policy.predict_action_batch(obs, mode="eval", compute_values=False)
+    rng = torch.Generator(device=policy.device).manual_seed(seed)
+    act, _ = policy.predict_action_batch(obs, mode="eval", rng=rng)
     os.environ["RLINF_PI05_WRIST_MODE"] = "real"
     act = act.detach().float().cpu().numpy() if torch.is_tensor(act) else np.asarray(act, np.float32)
     return act.reshape(b, -1, 7)[:, :8]
