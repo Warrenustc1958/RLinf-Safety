@@ -207,12 +207,13 @@ def process(task):
         for k, c in enumerate(CHANNELS):
             if full_cost[n_act:, k].any() and not lab["cost"][:, k].any():
                 codes[f"event_only_after_trim:{c}"] += 1
-        with np.load(row["labels"]) as w:
-            wv = w["violation"][:n_act]
-            if not np.array_equal(wv, lab["official_violation"]):
-                codes["wan_npz_violation_neq_audit"] += 1
-            if not np.allclose(w["actions"][:n_act], lab["action"], atol=1e-6):
-                codes["wan_npz_action_neq_audit"] += 1
+        if row.get("labels"):  # Wan label NPZ cross-check (fresh collections have none)
+            with np.load(row["labels"]) as w:
+                wv = w["violation"][:n_act]
+                if not np.array_equal(wv, lab["official_violation"]):
+                    codes["wan_npz_violation_neq_audit"] += 1
+                if not np.allclose(w["actions"][:n_act], lab["action"], atol=1e-6):
+                    codes["wan_npz_action_neq_audit"] += 1
         success = bool(lab["success"].any())
         rule_unsafe = bool((lab["cost"] & lab["valid"]).any())
         actual_q = None if legacy else {(True, False): "Q1", (True, True): "Q2", (False, False): "Q3",
@@ -250,12 +251,14 @@ def main():
     ap.add_argument("--out", default=str(OUT_ROOT / "labels"))
     ap.add_argument("--workers", type=int, default=48)
     ap.add_argument("--limit", type=int, default=0, help="first N rows per index (pilot)")
+    ap.add_argument("--index_root", default=str(INDEX_ROOT))
+    ap.add_argument("--indexes", default=",".join(INDEXES))
     args = ap.parse_args()
     out = Path(args.out)
     (out / "labels").mkdir(parents=True, exist_ok=True)
     tasks = []
-    for index in INDEXES:
-        rows = [json.loads(l) for l in (INDEX_ROOT / index / "manifest.jsonl").read_text().splitlines()]
+    for index in args.indexes.split(","):
+        rows = [json.loads(l) for l in (Path(args.index_root) / index / "manifest.jsonl").read_text().splitlines()]
         if args.limit:
             rows = rows[: args.limit]
         tasks += [(index, r, out) for r in rows]
