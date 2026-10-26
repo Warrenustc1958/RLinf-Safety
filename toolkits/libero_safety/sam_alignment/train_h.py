@@ -247,6 +247,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--val_frac", type=float, default=0.2)
+    ap.add_argument("--holdout_frac", type=float, default=0.0,
+                    help="group-disjoint share of --h_train kept out of thresholds / h fitting, used as eval set")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -273,9 +275,17 @@ def main():
     lg_p, f_p = frozen_outputs(model, np.load(Path(args.pilot) / "gen_z.npy", mmap_mode="r"), pm, p_rows)
     log(f"frozen outputs: h_train {len(h_rows)} rows, pilot {len(p_rows)} rows")
 
-    # R90 thresholds on h_train TF rows (generated), never on the pilot. h_train_v1 has no uniform TF
-    # rows (event chunks + pairs only); the recall threshold depends only on positive scores.
-    tfu = np.flatnonzero(hm["mode"][h_rows] == 0)
+    # group-disjoint holdout of h_train (eval only: never used for thresholds or fitting)
+    rng = np.random.default_rng(0)
+    hg = hm["group"][h_rows]
+    ug_all = np.unique(hg)
+    ho_groups = set(rng.choice(ug_all, int(round(args.holdout_frac * len(ug_all))), replace=False)) \
+        if args.holdout_frac > 0 else set()
+    ho = np.array([g in ho_groups for g in hg])
+
+    # R90 thresholds on the fitting part of h_train TF rows (generated), never on the pilot or holdout.
+    # The recall threshold depends only on positive scores.
+    tfu = np.flatnonzero((hm["mode"][h_rows] == 0) & ~ho)
     pos, known, score, _ = chunk_labels(hm, h_rows[tfu], lg_h[tfu])
     thr = {}
     for k, ch in enumerate(CHANNELS):
@@ -285,33 +295,48 @@ def main():
 
     dh = build(hm, h_rows, lg_h, f_h, thr)
     dp = build(pm, p_rows, lg_p, f_p, thr)
-    ug = np.unique(dh["group"])
-    rng = np.random.default_rng(0)
+    ug = np.unique(dh["group"][~ho])
     va_groups = set(rng.choice(ug, int(round(args.val_frac * len(ug))), replace=False))
-    va = np.array([g in va_groups for g in dh["group"]])
-    log(f"h_train split: train {int((~va).sum())} rows / val {int(va.sum())} rows, groups {len(ug)}; "
-        f"error>0 rows per channel {[int(((dh['err'][:, k] > 0) & dh['known'][:, k]).sum()) for k in range(K)]}")
+    va = np.array([g in va_groups for g in dh["group"]]) & ~ho
+    tr = ~va & ~ho
+    log(f"h_train split: fit {int(tr.sum())} / val {int(va.sum())} / holdout {int(ho.sum())} rows, "
+        f"groups {len(ug_all)} (holdout {len(ho_groups)}); error>0 rows per channel (fit+val) "
+        f"{[int(((dh['err'][~ho, k] > 0) & dh['known'][~ho, k]).sum()) for k in range(K)]}")
 
-    sel = {"pilot_all": np.arange(len(p_rows)), "pilot_tf": np.flatnonzero(pm["mode"][p_rows] == 0),
-           "pilot_ar": np.flatnonzero(pm["mode"][p_rows] == 1),
-           "pilot_ar_d9_16": np.flatnonzero((pm["mode"][p_rows] == 1) & (pm["depth"][p_rows] >= 9))}
-    report = {"cost": args.cost, "thr_r90_h_train_tf": thr, "seeds": {}}
+    def buckets(mode, depth, base, prefix):
+        out = {f"{prefix}_all": base, f"{prefix}_tf": base[mode[base] == 0], f"{prefix}_ar": base[mode[base] == 1]}
+        for name, (lo, hi) in (("d1_4", (1, 4)), ("d5_8", (5, 8)), ("d9_16", (9, 16)), ("d17_32", (17, 32))):
+            r = base[(mode[base] == 1) & (depth[base] >= lo) & (depth[base] <= hi)]
+            if len(r):
+                out[f"{prefix}_ar_{name}"] = r
+        return out
+
+    # eval sets: (built dict, row indices into it)
+    sel = {k: ("p", r) for k, r in buckets(pm["mode"][p_rows], pm["depth"][p_rows], np.arange(len(p_rows)),
+                                          "pilot").items()}
+    if ho.any():
+        sel.update({k: ("h", r) for k, r in buckets(hm["mode"][h_rows], hm["depth"][h_rows], np.flatnonzero(ho),
+                                                   "hold").items()})
+    report = {"cost": args.cost, "thr_r90_h_train_tf": thr, "holdout_groups": len(ho_groups), "seeds": {}}
+    main_set = "hold_all" if ho.any() else "pilot_all"
     for seed in range(args.seeds):
-        preds, fitinfo = {}, {}
+        preds, fitinfo = {"p": {}, "h": {}}, {}
         for name in ("simple", "h", "h_depth"):
             x = dh["x"][name]
-            net, vloss, ep = fit(x[~va], dh["err"][~va], dh["known"][~va], x[va], dh["err"][va], dh["known"][va],
+            net, vloss, ep = fit(x[tr], dh["err"][tr], dh["known"][tr], x[va], dh["err"][va], dh["known"][va],
                                  seed=seed)
             with torch.no_grad():
-                preds[name] = net(torch.from_numpy(dp["x"][name]).cuda()).cpu().numpy()
+                preds["p"][name] = net(torch.from_numpy(dp["x"][name]).cuda()).cpu().numpy()
+                preds["h"][name] = net(torch.from_numpy(x).cuda()).cpu().numpy()
             fitinfo[name] = {"val_huber": vloss, "epochs": ep + 1}
         rs = {"fit": fitinfo, "ranking": {}, "gating": {}}
-        for sname, r in sel.items():
-            rs["ranking"][sname] = {name: ranking_report(dp, p, thr, r) for name, p in preds.items()}
-            rs["gating"][sname] = gate_curves(dp, preds, thr, r, seed=seed)
+        for sname, (src, r) in sel.items():
+            d, pr = (dp, preds["p"]) if src == "p" else (dh, preds["h"])
+            rs["ranking"][sname] = {name: ranking_report(d, p, thr, r) for name, p in pr.items()}
+            rs["gating"][sname] = gate_curves(d, pr, thr, r, seed=seed)
         report["seeds"][seed] = rs
-        g = rs["gating"]["pilot_all"]["points"]
-        log(f"seed {seed} fit {fitinfo} | pilot_all miss@rel " + " ".join(
+        g = rs["gating"][main_set]["points"]
+        log(f"seed {seed} fit {fitinfo} | {main_set} miss@rel " + " ".join(
             f"{p['rel']}: cost {p['cost_only']['miss_rate']:.3f} simple {p['cost+simple']['miss_rate']:.3f} "
             f"h {p['cost+h']['miss_rate']:.3f} hd {p['cost+h_depth']['miss_rate']:.3f}" for p in g))
     report["hours"] = (time.time() - t_start) / 3600

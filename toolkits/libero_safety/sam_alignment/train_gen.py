@@ -169,6 +169,9 @@ def main():
     ap.add_argument("--bootstrap", type=int, default=200)
     ap.add_argument("--max_steps", type=int, default=0, help="smoke test")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--exclude_groups", default="", help="json list of init-state groups dropped from training (CV)")
+    ap.add_argument("--no_select", action="store_true",
+                    help="no model selection: train --epochs, best.pt = last epoch (dev score only logged)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -191,6 +194,8 @@ def main():
     pdir = Path(args.pairs)
     tm = load_meta(pdir / "meta.npz")
     keep = (tm["mode"] == 0) | ((tm["mode"] == 1) & (tm["depth"] <= args.ar_max_depth))
+    if args.exclude_groups:
+        keep &= ~np.isin(tm["group"], json.load(open(args.exclude_groups)))
     rows = np.flatnonzero(keep)
     train = PairRows(pdir, rows, tm)
     _, ginv, gcnt = np.unique(tm["group"][rows], return_inverse=True, return_counts=True)
@@ -303,7 +308,11 @@ def main():
             f"{ch} {r['chunk']['ap'] and round(r['chunk']['ap'], 3)}" for ch, r in r_tf.items()) + " | ar " + " ".join(
             f"{ch} {r['chunk']['ap'] and round(r['chunk']['ap'], 3)}(pos {r['chunk']['pos']})" for ch, r in r_ar.items()))
         torch.save({"model_state_dict": model.state_dict(), "config": model.config(), "epoch": epoch}, out / "last.pt")
-        if score > best:
+        if args.no_select:
+            best = score
+            torch.save({"model_state_dict": model.state_dict(), "config": model.config(), "epoch": epoch},
+                       out / "best.pt")
+        elif score > best:
             best, bad = score, 0
             torch.save({"model_state_dict": model.state_dict(), "config": model.config(), "epoch": epoch},
                        out / "best.pt")
