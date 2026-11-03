@@ -49,7 +49,9 @@ from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwar
 
 from toolkits.libero_safety.wan_ac_sft.dual_view import enable_dual, stack_pil
 from toolkits.libero_safety.wan_ac_sft.fp32_master import patch_flash_attention, to_fp32_master
-from toolkits.libero_safety.wan_ac_sft.sampler import WanACSFTDataset
+from toolkits.libero_safety.wan_ac_sft.gen_hist import GenHistItems
+from toolkits.libero_safety.wan_ac_sft.pose_cond import enable_pose, load_stats, pose_features
+from toolkits.libero_safety.wan_ac_sft.sampler import NULL_ACTION, WanACSFTDataset, WindowSampler
 from toolkits.libero_safety.wan_ac_sft.train_wan_ac_sft import _load_reference_trainer
 
 CAT_KEYS = ("noise", "latents", "input_latents", "first_frame_latents")
@@ -58,11 +60,43 @@ BINS = ("template", "lt2", "2to5", "ge5")
 
 
 def as_trainer_item(it, dual):
-    """Dataset item -> trainer dict; dual stacks agent over wrist (dual_view.stack_pil)."""
+    """Dataset item -> trainer dict; dual stacks agent over wrist (dual_view.stack_pil). With ``pose`` in the item
+    (T1) the per-frame pose features are appended after the 7 action dims."""
+    act = it["action"] if "pose" not in it else np.concatenate([it["action"], it["pose"]], 1)
     if dual:
         video = stack_pil(it["video"], it["wrist_video"])
-        return {"video": video, "reference_image": [video[0]], "action": torch.from_numpy(it["action"])}
-    return {"video": it["video"], "reference_image": it["reference_image"], "action": torch.from_numpy(it["action"])}
+        return {"video": video, "reference_image": [video[0]], "action": torch.from_numpy(act)}
+    return {"video": it["video"], "reference_image": it["reference_image"], "action": torch.from_numpy(act)}
+
+
+class PoseItems:
+    """T1: adds per-frame pose features (pose_cond.pose_features) from ``<pose_index>/<idx>.npy``. The static-video
+    augmentation is done here instead of in the reference trainer, so the held pose is frame 0's real pose (the
+    reference version would also zero the pose features)."""
+
+    def __init__(self, inner, pose_index, stats, static_prob=0.0, seed=0):
+        self.inner, self.dir, self.stats, self.static_prob, self.seed = inner, Path(pose_index), stats, static_prob, seed
+        self.view = inner.view
+        keep = [r for r in inner.rows if (self.dir / f"{r['idx']}.npy").exists()]  # legacy episodes lack labels
+        if len(keep) < len(inner.rows):
+            print(f"[pose] {len(inner.rows) - len(keep)} episodes without pose labels dropped", flush=True)
+            inner.rows = keep
+            inner.sampler = WindowSampler(keep, motion=inner.sampler.motion)
+
+    def __len__(self):
+        return len(self.inner)
+
+    def __getitem__(self, i):
+        it = self.inner[i]
+        st = np.load(self.dir / f"{it['meta']['idx']}.npy")[it["meta"]["frame_ids"]]
+        if self.static_prob > 0 and np.random.default_rng([self.seed, i, 17]).random() < self.static_prob:
+            for k in ("video", "wrist_video"):
+                if k in it:
+                    it[k] = [it[k][0]] * len(it[k])
+            it["action"] = np.repeat(NULL_ACTION[None], len(it["action"]), 0)
+            st = np.repeat(st[:1], len(st), 0)
+        it["pose"] = pose_features(st, self.stats)
+        return it
 
 
 class ItemDataset(torch.utils.data.Dataset):
@@ -167,6 +201,22 @@ def main():
     ap.add_argument("--seed", type=int, default=21)
     ap.add_argument("--view", default="agent", choices=["agent", "dual"],
                     help="dual = agentview stacked over wrist, latent-level concat (dual_view.py)")
+    ap.add_argument("--pose_index", default=None, help="T1: per-episode pose npy dir (build_pose_index.py); enables "
+                                                       "pose conditioning (pose_cond.py)")
+    ap.add_argument("--pose_lr", type=float, default=1e-4, help="peak lr of the (zero-initialised) pose heads")
+    ap.add_argument("--grad_ckpt", type=int, default=0, help="1 = gradient checkpointing of the DiT blocks")
+    ap.add_argument("--gen_hist", default=None, help="T3: t0_gen.py output dir; train windows use the generated "
+                                                     "history with probability --gen_hist_prob")
+    ap.add_argument("--gen_hist_prob", type=float, default=0.7)
+    ap.add_argument("--gen_val", default=None, help="t0_gen.py output dir: also report the loss on its val-split "
+                                                    "generated histories (default: --gen_hist)")
+    ap.add_argument("--val_at_start", type=int, default=1, help="1 = validate before the first step of a fresh run")
+    ap.add_argument("--zero1", type=int, default=0,
+                    help="1 = shard the AdamW states over the ranks (torch ZeroRedundancyOptimizer); needs "
+                         "--save_resume 0 (no consolidated optimizer state is written)")
+    ap.add_argument("--save_resume", type=int, default=1,
+                    help="0 = do not write resume/ (fp32 weights + optimizer, ~80 GB); a restart then continues "
+                         "from the newest EMA export with a fresh optimizer")
     args = ap.parse_args()
 
     out = Path(args.output)
@@ -199,11 +249,17 @@ def main():
     ref = _load_reference_trainer()
     patch_flash_attention()
     net = ref.WanTrainingModule(model_paths=json.dumps([[args.init_dit], args.vae]), trainable_models="dit",
-                                extra_inputs="input_image,action", static_video_prob=args.static_video_prob,
+                                extra_inputs="input_image,action",
+                                static_video_prob=0.0 if args.pose_index else args.static_video_prob,
+                                use_gradient_checkpointing=bool(args.grad_ckpt),
                                 context_noise_sigma=0.0)
     net.pipe.device = acc.device
     if args.view == "dual":
         enable_dual(net.pipe)
+    pose_stats = None
+    if args.pose_index:
+        pose_stats = load_stats(str(Path(args.pose_index) / "stats.json"))
+        enable_pose(net.pipe.dit, views=2 if args.view == "dual" else 1)
     named = [(n, p) for n, p in net.named_parameters() if p.requires_grad]
     if prog and fallback is None:  # fp32 weights of the resume point
         sd = torch.load(out / "resume" / "model_fp32.pt", map_location="cpu", weights_only=True)
@@ -225,21 +281,51 @@ def main():
               f"{acc.num_processes * args.batch * args.accum}; trainable {sum(p.numel() for p in params) / 1e9:.2f}B fp32")
 
     model = BatchLoss(net)
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
+    is_pose = [".pose_mlp_" in n for n, _ in named]
+    groups = [{"params": [p for (_, p), f in zip(named, is_pose) if not f], "lr": args.lr}]
+    if any(is_pose):
+        groups.append({"params": [p for (_, p), f in zip(named, is_pose) if f], "lr": args.pose_lr})
+        acc.print(f"[cws] pose heads: {sum(p.numel() for (_, p), f in zip(named, is_pose) if f) / 1e6:.1f}M params, "
+                  f"lr {args.pose_lr}")
+    if args.zero1:
+        if args.save_resume:
+            raise ValueError("--zero1 needs --save_resume 0")
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+
+        opt = ZeroRedundancyOptimizer(groups[0]["params"], optimizer_class=torch.optim.AdamW, lr=args.lr,
+                                      weight_decay=args.wd)
+        for g in groups[1:]:
+            opt.add_param_group(g)
+    else:
+        opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda k: lr_factor(k + start, args.warmup, args.max_steps, args.lr_floor))
 
     train = ItemDataset(WanACSFTDataset(args.index, "train", args.view, 50_000_000, args.seed,
                                         motion_weight=bool(args.motion_weight), motion_power=args.motion_power,
                                         motion_floor=args.motion_floor, pose_scale=args.pose_scale,
-                                        pose_clip=args.pose_clip))
+                                        pose_clip=args.pose_clip)
+                         if not args.pose_index else
+                         PoseItems(WanACSFTDataset(args.index, "train", args.view, 50_000_000, args.seed,
+                                                   motion_weight=bool(args.motion_weight), motion_power=args.motion_power,
+                                                   motion_floor=args.motion_floor, pose_scale=args.pose_scale,
+                                                   pose_clip=args.pose_clip),
+                                   args.pose_index, pose_stats, args.static_video_prob, args.seed))
+    if args.gen_hist:
+        if args.pose_index:
+            raise ValueError("--gen_hist with --pose_index is not supported")
+        train.inner = GenHistItems(train.inner, args.gen_hist, "train", args.gen_hist_prob, args.seed)
+        acc.print(f"[cws] generated histories: {len(train.inner.rows)} episodes, p = {args.gen_hist_prob}")
     gen = torch.Generator()
     gen.manual_seed(args.seed * 1_000_003 + start)
     dl = torch.utils.data.DataLoader(train, batch_size=args.batch,
                                      sampler=torch.utils.data.RandomSampler(train, generator=gen),
                                      collate_fn=lambda x: x, num_workers=args.workers,
                                      persistent_workers=args.workers > 0, prefetch_factor=4, drop_last=True)
-    model, opt, dl = acc.prepare(model, opt, dl)
+    if args.zero1:  # AcceleratedOptimizer calls state_dict(), which ZeRO refuses before consolidation
+        model, dl = acc.prepare(model, dl)
+    else:
+        model, opt, dl = acc.prepare(model, opt, dl)
     if prog and fallback is None and (out / "resume" / "opt.pt").exists():
         opt.load_state_dict(torch.load(out / "resume" / "opt.pt", map_location="cpu", weights_only=False))
         acc.print("[cws] optimizer state restored")
@@ -268,14 +354,19 @@ def main():
     for i in range(args.val_items):
         row, ids, _ = val_ds.sampler.draw(np.random.default_rng([val_ds.seed, i]))
         val_bins.append(motion_bin(args.index, row, ids))
+    if args.pose_index:
+        val_ds = PoseItems(val_ds, args.pose_index, pose_stats)
 
-    def run_val():
+    def run_val(shuffle_pose=False):
+        """shuffle_pose (T1): every item gets the pose of item i + 1, a check that the pose input is used."""
         inner = acc.unwrap_model(model)
         inner.eval()
         tot = torch.zeros(2 * (len(BINS) + 1), device=acc.device)
         with torch.no_grad():
             for i in range(acc.process_index, args.val_items, acc.num_processes):
                 it = val_ds[i]
+                if shuffle_pose:
+                    it["pose"] = val_ds[(i + 1) % args.val_items]["pose"]
                 d = as_trainer_item(it, args.view == "dual")
                 with torch.random.fork_rng(devices=[acc.device]):
                     torch.manual_seed(1_000_000 + i)
@@ -294,6 +385,44 @@ def main():
         mem = torch.tensor([torch.cuda.max_memory_allocated() / 2**30], device=acc.device)
         res["peak_mem_gb_per_rank"] = [round(float(x), 1) for x in acc.gather(mem)]
         return res
+
+    gen_dir = args.gen_val or args.gen_hist
+    gen_val_ds = None
+    if gen_dir:
+        g_inner = WanACSFTDataset(args.index, "val", args.view, args.val_items, args.seed + 2, motion_weight=True,
+                                  pose_scale=args.pose_scale, pose_clip=args.pose_clip)
+        gen_val_ds = GenHistItems(g_inner, gen_dir, "val", p=1.0, seed=args.seed + 2, deterministic=True)
+        if args.pose_index:
+            gen_val_ds = PoseItems(gen_val_ds, args.pose_index, pose_stats)
+
+    def gen_val():
+        """Loss on generated (open-loop dual-41k) histories with the recorded future: the T3 objective."""
+        inner = acc.unwrap_model(model)
+        inner.eval()
+        tot = torch.zeros(2, device=acc.device)
+        with torch.no_grad():
+            for i in range(acc.process_index, args.val_items, acc.num_processes):
+                d = as_trainer_item(gen_val_ds[i], args.view == "dual")
+                with torch.random.fork_rng(devices=[acc.device]):
+                    torch.manual_seed(2_000_000 + i)
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        loss = inner([d])
+                if torch.isfinite(loss):
+                    tot[0] += loss.float(); tot[1] += 1
+        tot = acc.reduce(tot, reduction="sum")
+        inner.train()
+        return float(tot[0] / tot[1]) if tot[1] > 0 else None
+
+    def validate(step):
+        v = run_val()
+        if args.pose_index:
+            v["shuffled_pose"] = run_val(shuffle_pose=True)["all"]
+        if gen_val_ds is not None:
+            v["gen_hist"] = gen_val()
+        acc.print(f"[val] step {step} " + json.dumps(v))
+        if stats:
+            stats.write(json.dumps({"step": step, "val": v}) + "\n")
+            stats.flush()
 
     def export(named_tensors, path):
         """{full param name: tensor} -> bf16 safetensors with the reference key names."""
@@ -337,9 +466,13 @@ def main():
                         raise IOError(f"EMA shards hold {len(merged)} tensors, expected {len(named)}")
                     export(merged, out / f"ema-step-{step}.safetensors")
                     del merged
-                torch.save({n: p.detach().cpu() for n, p in named}, tmp / "model_fp32.pt")
-                torch.save(opt.state_dict(), tmp / "opt.pt")
-                (tmp / "COMPLETE").write_text(str(step))
+                if args.save_resume:
+                    torch.save({n: p.detach().cpu() for n, p in named}, tmp / "model_fp32.pt")
+                    torch.save(opt.state_dict(), tmp / "opt.pt")
+                    (tmp / "COMPLETE").write_text(str(step))
+                else:  # EMA export only; the fp32 EMA shards are not needed either
+                    for f in tmp.glob("ema_shard_*.pt"):
+                        f.unlink()
                 old = out / "resume.old"
                 if not args.resume_inplace:
                     shutil.rmtree(old, ignore_errors=True)
@@ -366,6 +499,8 @@ def main():
 
     stats = (out / "step_stats.jsonl").open("a") if acc.is_main_process else None
     step, bad_run, it_dl = start, 0, iter(dl)
+    if args.val_at_start and args.val_every and start == 0:
+        validate(0)
     t = time.perf_counter()
     while step < args.max_steps:
         model.train()
@@ -416,11 +551,7 @@ def main():
                       f"lr {sched.get_last_lr()[0]:.2e} {now - t:.2f}s/step", flush=True)
         t = now
         if args.val_every and step % args.val_every == 0:
-            v = run_val()
-            acc.print(f"[val] step {step} " + json.dumps(v))
-            if stats:
-                stats.write(json.dumps({"step": step, "val": v}) + "\n")
-                stats.flush()
+            validate(step)
         if step % args.save_every == 0 or step == args.max_steps:
             save(step)
     if acc.is_main_process:
