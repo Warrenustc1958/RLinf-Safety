@@ -74,14 +74,21 @@ class PoseItems:
     augmentation is done here instead of in the reference trainer, so the held pose is frame 0's real pose (the
     reference version would also zero the pose features)."""
 
-    def __init__(self, inner, pose_index, stats, static_prob=0.0, seed=0):
+    def __init__(self, inner, pose_index, stats, static_prob=0.0, seed=0, noise_cm=0.0, noise_deg=0.0):
         self.inner, self.dir, self.stats, self.static_prob, self.seed = inner, Path(pose_index), stats, static_prob, seed
+        self.noise_cm, self.noise_deg = float(noise_cm), float(noise_deg)
         self.view = inner.view
-        keep = [r for r in inner.rows if (self.dir / f"{r['idx']}.npy").exists()]  # legacy episodes lack labels
-        if len(keep) < len(inner.rows):
-            print(f"[pose] {len(inner.rows) - len(keep)} episodes without pose labels dropped", flush=True)
-            inner.rows = keep
-            inner.sampler = WindowSampler(keep, motion=inner.sampler.motion)
+        # legacy episodes lack labels: drop them at every level that draws episodes (GenHistItems wraps the sampler)
+        m = inner
+        while m is not None and hasattr(m, "rows"):
+            keep = [r for r in m.rows if (self.dir / f"{r['idx']}.npy").exists()]
+            if len(keep) < len(m.rows):
+                print(f"[pose] {type(m).__name__}: {len(m.rows) - len(keep)} episodes without pose labels dropped",
+                      flush=True)
+                m.rows = keep
+                if getattr(m, "sampler", None) is not None:
+                    m.sampler = WindowSampler(keep, motion=m.sampler.motion)
+            m = getattr(m, "inner", None)
 
     def __len__(self):
         return len(self.inner)
@@ -95,6 +102,14 @@ class PoseItems:
                     it[k] = [it[k][0]] * len(it[k])
             it["action"] = np.repeat(NULL_ACTION[None], len(it["action"]), 0)
             st = np.repeat(st[:1], len(st), 0)
+        if self.noise_cm > 0 or self.noise_deg > 0:  # train with the causal estimator's error (R4: ~3 cm / 3 deg)
+            from scipy.spatial.transform import Rotation as Rot
+
+            g = np.random.default_rng([self.seed, i, 23])
+            st = st.copy()
+            st[:, :3] += g.normal(0, self.noise_cm / 100 / np.sqrt(3), 3).astype(np.float32)  # one offset per window
+            r = Rot.from_rotvec(g.normal(0, np.radians(self.noise_deg) / np.sqrt(3), 3))
+            st[:, 3:7] = (r * Rot.from_quat(st[:, 3:7])).as_quat().astype(np.float32)
         it["pose"] = pose_features(st, self.stats)
         return it
 
@@ -204,6 +219,9 @@ def main():
     ap.add_argument("--pose_index", default=None, help="T1: per-episode pose npy dir (build_pose_index.py); enables "
                                                        "pose conditioning (pose_cond.py)")
     ap.add_argument("--pose_lr", type=float, default=1e-4, help="peak lr of the (zero-initialised) pose heads")
+    ap.add_argument("--pose_noise_cm", type=float, default=0.0,
+                    help="train-time pose noise (one offset per window), the size of the inference estimator's error")
+    ap.add_argument("--pose_noise_deg", type=float, default=0.0)
     ap.add_argument("--grad_ckpt", type=int, default=0, help="1 = gradient checkpointing of the DiT blocks")
     ap.add_argument("--gen_hist", default=None, help="T3: t0_gen.py output dir; train windows use the generated "
                                                      "history with probability --gen_hist_prob")
@@ -308,21 +326,20 @@ def main():
         opt, lambda k: lr_factor(k + start, args.warmup, args.max_steps, args.lr_floor)
         * (min(1.0, (k + 1) / ramp) if ramp else 1.0))
 
-    train = ItemDataset(WanACSFTDataset(args.index, "train", args.view, 50_000_000, args.seed,
-                                        motion_weight=bool(args.motion_weight), motion_power=args.motion_power,
-                                        motion_floor=args.motion_floor, pose_scale=args.pose_scale,
-                                        pose_clip=args.pose_clip)
-                         if not args.pose_index else
-                         PoseItems(WanACSFTDataset(args.index, "train", args.view, 50_000_000, args.seed,
-                                                   motion_weight=bool(args.motion_weight), motion_power=args.motion_power,
-                                                   motion_floor=args.motion_floor, pose_scale=args.pose_scale,
-                                                   pose_clip=args.pose_clip),
-                                   args.pose_index, pose_stats, args.static_video_prob, args.seed))
+    # dataset stack: WanACSFTDataset -> [GenHistItems (T3)] -> [PoseItems (T1)] -> ItemDataset
+    base = WanACSFTDataset(args.index, "train", args.view, 50_000_000, args.seed,
+                           motion_weight=bool(args.motion_weight), motion_power=args.motion_power,
+                           motion_floor=args.motion_floor, pose_scale=args.pose_scale, pose_clip=args.pose_clip)
+    ds = base
     if args.gen_hist:
-        if args.pose_index:
-            raise ValueError("--gen_hist with --pose_index is not supported")
-        train.inner = GenHistItems(train.inner, args.gen_hist, "train", args.gen_hist_prob, args.seed)
-        acc.print(f"[cws] generated histories: {len(train.inner.rows)} episodes, p = {args.gen_hist_prob}")
+        ds = GenHistItems(ds, args.gen_hist, "train", args.gen_hist_prob, args.seed)
+    if args.pose_index:
+        ds = PoseItems(ds, args.pose_index, pose_stats, args.static_video_prob, args.seed,
+                       args.pose_noise_cm, args.pose_noise_deg)
+    if args.gen_hist:
+        acc.print(f"[cws] generated histories: {len((ds.inner if args.pose_index else ds).rows)} episodes, "
+                  f"p = {args.gen_hist_prob}")
+    train = ItemDataset(ds)
     gen = torch.Generator()
     gen.manual_seed(args.seed * 1_000_003 + start)
     dl = torch.utils.data.DataLoader(train, batch_size=args.batch,
