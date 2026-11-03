@@ -211,6 +211,9 @@ def main():
     ap.add_argument("--gen_val", default=None, help="t0_gen.py output dir: also report the loss on its val-split "
                                                     "generated histories (default: --gen_hist)")
     ap.add_argument("--val_at_start", type=int, default=1, help="1 = validate before the first step of a fresh run")
+    ap.add_argument("--rewarmup", type=int, default=0,
+                    help="restart with a fresh optimizer (EMA fallback, e.g. a continued run): ramp the lr linearly "
+                         "from 0 to the schedule over this many steps; 0 = jump straight to the schedule")
     ap.add_argument("--zero1", type=int, default=0,
                     help="1 = shard the AdamW states over the ranks (torch ZeroRedundancyOptimizer); needs "
                          "--save_resume 0 (no consolidated optimizer state is written)")
@@ -298,8 +301,12 @@ def main():
             opt.add_param_group(g)
     else:
         opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.wd)
+    ramp = args.rewarmup if fallback is not None else 0  # only when the optimizer state is new
+    if ramp:
+        acc.print(f"[cws] re-warmup over {ramp} steps from step {start}")
     sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda k: lr_factor(k + start, args.warmup, args.max_steps, args.lr_floor))
+        opt, lambda k: lr_factor(k + start, args.warmup, args.max_steps, args.lr_floor)
+        * (min(1.0, (k + 1) / ramp) if ramp else 1.0))
 
     train = ItemDataset(WanACSFTDataset(args.index, "train", args.view, 50_000_000, args.seed,
                                         motion_weight=bool(args.motion_weight), motion_power=args.motion_power,
